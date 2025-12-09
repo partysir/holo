@@ -239,6 +239,85 @@ class TushareDataSource:
             print(f"✗ 获取 {ts_code} 基本面数据失败: {e}")
             return None
 
+    # ========== 新增: 行业数据获取 ==========
+
+    def get_industry_data(self, instruments, use_cache=True):
+        """
+        获取股票行业数据（新增方法 - 使用 stock_basic）
+
+        Args:
+            instruments: 股票代码列表
+            use_cache: 是否使用缓存
+
+        Returns:
+            DataFrame: [instrument, industry]
+        """
+        if self.pro is None:
+            return pd.DataFrame({
+                'instrument': instruments,
+                'industry': 'Unknown'
+            })
+
+        # 检查缓存
+        cache_name = f"industry_data_all"
+        if use_cache and self.cache:
+            cached_data = self.cache.load_from_cache(cache_name)
+            if cached_data is not None:
+                cached_data = cached_data[cached_data['instrument'].isin(instruments)]
+                if len(cached_data) > 0:
+                    print(f"  ✓ 从缓存加载行业数据")
+                    return cached_data
+
+        try:
+            print(f"  📊 获取 {len(instruments)} 只股票的行业数据...")
+
+            # ✅ 使用 stock_basic 获取申万行业（一次调用获取所有）
+            stock_basic = self.pro.stock_basic(
+                exchange='',
+                list_status='L',
+                fields='ts_code,name,industry'
+            )
+
+            # 保存完整数据到缓存
+            if use_cache and self.cache:
+                stock_basic_cache = stock_basic.rename(columns={'ts_code': 'instrument'})
+                self.cache.save_to_cache(stock_basic_cache[['instrument', 'industry']], cache_name)
+
+            # 过滤目标股票
+            stock_basic = stock_basic[stock_basic['ts_code'].isin(instruments)]
+            stock_basic = stock_basic.rename(columns={'ts_code': 'instrument'})
+            stock_basic['industry'] = stock_basic['industry'].fillna('其他')
+
+            result = stock_basic[['instrument', 'industry']]
+
+            # 补充未匹配的股票
+            missing = set(instruments) - set(result['instrument'])
+            if missing:
+                print(f"  ⚠️  {len(missing)} 只股票未找到行业，标记为'其他'")
+                missing_df = pd.DataFrame({
+                    'instrument': list(missing),
+                    'industry': '其他'
+                })
+                result = pd.concat([result, missing_df], ignore_index=True)
+
+            print(f"  ✓ 行业数据获取完成")
+            print(f"     覆盖率: {(len(result) - len(missing)) / len(instruments) * 100:.1f}%")
+            print(f"     行业数: {result['industry'].nunique()}个")
+
+            # 显示行业分布
+            top_industries = result['industry'].value_counts().head(5)
+            print(f"     TOP5行业:")
+            for ind, cnt in top_industries.items():
+                print(f"       - {ind}: {cnt}只")
+
+            return result
+
+        except Exception as e:
+            print(f"  ⚠️  获取行业数据失败: {e}")
+            return pd.DataFrame({
+                'instrument': instruments,
+                'industry': 'Unknown'
+            })
     # ========== 新增: 基本面财务数据获取 ==========
 
     def get_financial_indicators(self, ts_code, start_date, end_date):
@@ -608,12 +687,13 @@ class StockRankerModel:
         print("✓ 评分计算完成")
         return df
 
+
 def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
                            cache_manager=None, use_stockranker=True,
                            custom_weights=None, tushare_token=None,
                            use_fundamental=True):
     """
-    从Tushare加载数据并计算因子 (扩展版 - 支持基本面因子)
+    从Tushare加载数据并计算因子 (扩展版 - 支持基本面因子 + 行业数据)
 
     :param start_date: 开始日期
     :param end_date: 结束日期
@@ -623,10 +703,10 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
     :param use_stockranker: 是否使用StockRanker模型
     :param custom_weights: 自定义因子权重
     :param tushare_token: Tushare token
-    :param use_fundamental: 是否使用基本面因子 (新增)
+    :param use_fundamental: 是否使用基本面因子
     """
     print("\n" + "=" * 80)
-    print("📦 数据加载模块 (Tushare版 + 基本面)")
+    print("📦 数据加载模块 (Tushare版 + 基本面 + 行业)")
     print("=" * 80)
 
     model_type = "StockRanker多因子" if use_stockranker else "简单技术因子"
@@ -695,7 +775,7 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
     # 合并价格数据
     price_df = pd.concat(all_price_data, ignore_index=True)
 
-    # ========== 获取基本面数据 (新增) ==========
+    # ========== 获取基本面数据 ==========
     if use_stockranker and use_fundamental:
         print(f"\n📈 获取基本面财务数据...")
         all_financial_data = []
@@ -706,7 +786,6 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
             if (i + 1) % 5 == 0:
                 print(f"{i + 1}/{len(stock_list)} ", end='', flush=True)
 
-            # 获取财务指标
             financial_df = data_source.get_financial_indicators(ts_code, start_date, end_date)
             if financial_df is not None and len(financial_df) > 0:
                 all_financial_data.append(financial_df)
@@ -714,14 +793,12 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
 
         print(f"\n✓ 成功获取 {financial_success}/{len(stock_list)} 只股票的财务数据")
 
-        # 合并基本面数据到价格数据
         if len(all_financial_data) > 0:
             financial_df = pd.concat(all_financial_data, ignore_index=True)
             print("\n🔗 合并基本面数据到日线数据...")
             price_df = data_source.merge_financial_data_to_daily(price_df, financial_df)
             print("✓ 基本面数据合并完成")
 
-            # 统计基本面数据覆盖率
             fundamental_cols = ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']
             available_cols = [col for col in fundamental_cols if col in price_df.columns]
             if available_cols:
@@ -735,7 +812,6 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
 
     # ========== 选择因子计算方法 ==========
     if use_stockranker:
-        # 使用StockRanker多因子模型
         model = StockRankerModel(
             custom_weights=custom_weights,
             use_fundamental=use_fundamental
@@ -743,7 +819,6 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
         factor_df = model.calculate_all_factors(price_df)
         factor_df = model.calculate_position_score(factor_df)
     else:
-        # 使用简单技术因子
         print("\n⚙️  计算简单技术因子...")
         factor_df = calculate_simple_factors(price_df)
 
@@ -751,6 +826,23 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
 
     result_factor = factor_df[['date', 'instrument', 'position']].copy()
     result_price = price_df.copy()
+
+    # ========== ✅ 关键添加：获取并合并行业数据 ==========
+    print("\n📊 获取行业数据...")
+    industry_data = data_source.get_industry_data(stock_list, use_cache=use_cache)
+
+    if industry_data is not None and len(industry_data) > 0:
+        # 合并行业数据到因子数据
+        result_factor = result_factor.merge(
+            industry_data,
+            on='instrument',
+            how='left'
+        )
+        result_factor['industry'] = result_factor['industry'].fillna('其他')
+        print(f"  ✓ 行业数据已合并到因子数据")
+    else:
+        result_factor['industry'] = 'Unknown'
+        print(f"  ⚠️  未能获取行业数据，使用默认值")
 
     # 保存到缓存
     if use_cache and cache_manager:
@@ -763,12 +855,12 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
     print(f"  - 价格数据: {len(result_price)} 条")
     print(f"  - 股票数量: {result_factor['instrument'].nunique()} 只")
     print(f"  - 交易日数: {result_factor['date'].nunique()} 天")
+    print(f"  - 行业数量: {result_factor['industry'].nunique()} 个")  # ✅ 添加行业统计
 
     if use_fundamental and use_stockranker:
         print(f"  - 基本面因子: 已启用 (ROE/ROA/毛利率/净利率/资产负债率)")
 
     return result_factor, result_price
-
 
 def calculate_simple_factors(price_data):
     """计算简单技术因子(兼容旧版本)"""
