@@ -1,0 +1,40 @@
+# 数据获取
+tushare>=1.2.89
+pandas>=1.5.0
+numpy>=1.23.0
+
+# 技术指标
+ta-lib>=0.4.0
+
+# 可视化
+matplotlib>=3.5.0
+seaborn>=0.12.0
+
+# 遗传算法（可选）
+deap>=1.3.0
+
+# 性能优化（可选）
+numba>=0.56.0
+
+# 系统工具
+psutil>=5.9.0
+```
+
+---
+
+## 📝 最终文件清单
+```
+pythonProject1/
+├── config.py                        ✅ 新增
+├── daily_runner.py                  ✅ 新增
+├── test_system.py                   ✅ 新增
+├── README.md                        ✅ 新增
+├── requirements.txt                 ✅ 更新
+├── data_module.py                   ✅ 已有
+├── data_module_incremental.py       ✅ 已有
+├── backtest_module_optimized.py     ✅ 已有
+├── ultimate_fast_system.py          ✅ 已有
+├── genetic_optimizer.py             ✅ 已有
+├── holdings_monitor.py              ✅ 已有
+├── visualization_module.py          ✅ 已有
+└── main.py                          ✅ 已有
