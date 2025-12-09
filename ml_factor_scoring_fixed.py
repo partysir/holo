@@ -1,11 +1,12 @@
 """
-ml_factor_scoring_advanced.py - 高级机器学习因子评分模块
+ml_factor_scoring_fixed.py - 高级机器学习因子评分模块（修复版）
 
 核心优化：
-✅ 1. 时间序列切分 - 避免前视偏差（Walk-Forward）
-✅ 2. 分类目标 - 预测TOP 20%股票
+✅ 1. 时间序列切分（避免前视偏差）
+✅ 2. 分类目标（预测TOP 20%）
 ✅ 3. IC加权 - 因子有效性动态评估
 ✅ 4. 滚动训练 - 自适应市场变化
+✅ 5. Tushare行业数据集成
 """
 
 import pandas as pd
@@ -614,12 +615,22 @@ class AdvancedMLScorer:
 
 
 # ============================================================================
-# 便捷函数
+# 行业数据获取（修复版 - 使用 Tushare stock_basic）
 # ============================================================================
 
 def get_industry_data(instruments, tushare_token=None):
-    """获取行业数据"""
+    """
+    获取行业数据 - 使用 Tushare stock_basic（最简单最快）
+
+    Args:
+        instruments: 股票代码列表
+        tushare_token: Tushare token
+
+    Returns:
+        DataFrame: [instrument, industry]
+    """
     if tushare_token is None:
+        print("  ⚠️  未提供 Tushare Token")
         return pd.DataFrame({
             'instrument': instruments,
             'industry': 'Unknown'
@@ -630,21 +641,48 @@ def get_industry_data(instruments, tushare_token=None):
         ts.set_token(tushare_token)
         pro = ts.pro_api()
 
+        print(f"  📊 获取 {len(instruments)} 只股票的行业数据...")
+
+        # ✅ 使用 stock_basic 获取申万行业（一次调用获取所有）
         stock_basic = pro.stock_basic(
             exchange='',
             list_status='L',
-            fields='ts_code,industry'
+            fields='ts_code,name,industry'  # industry是申万一级行业
         )
 
+        # 过滤目标股票
+        stock_basic = stock_basic[stock_basic['ts_code'].isin(instruments)]
         stock_basic['instrument'] = stock_basic['ts_code']
-        industry_data = stock_basic[
-            stock_basic['instrument'].isin(instruments)
-        ][['instrument', 'industry']]
+        stock_basic['industry'] = stock_basic['industry'].fillna('其他')
 
-        industry_data['industry'] = industry_data['industry'].fillna('Unknown')
+        result = stock_basic[['instrument', 'industry']]
 
-        return industry_data
-    except:
+        # 补充未匹配的股票
+        missing = set(instruments) - set(result['instrument'])
+        if missing:
+            print(f"  ⚠️  {len(missing)} 只股票未找到行业，标记为'其他'")
+            missing_df = pd.DataFrame({
+                'instrument': list(missing),
+                'industry': '其他'
+            })
+            result = pd.concat([result, missing_df], ignore_index=True)
+
+        print(f"  ✓ 获取到 {len(result)} 只股票的行业信息")
+        print(f"  ✓ 覆盖率: {(len(result) - len(missing))/len(instruments)*100:.1f}%")
+        print(f"  ✓ 行业分类: {result['industry'].nunique()} 个")
+
+        # 显示TOP5行业
+        top_industries = result['industry'].value_counts().head(5)
+        print(f"\n  📊 TOP5行业:")
+        for industry, count in top_industries.items():
+            print(f"     {industry}: {count}只")
+
+        return result
+
+    except Exception as e:
+        print(f"  ⚠️  获取行业数据失败: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame({
             'instrument': instruments,
             'industry': 'Unknown'
@@ -673,7 +711,15 @@ class IndustryBasedScorer:
         try:
             factor_data['industry_rank'] = factor_data.groupby(['date', 'industry'])['position'].rank(pct=True)
             print(f"  ✓ 行业评分完成")
-        except:
+
+            # 统计行业分布
+            industry_dist = factor_data.groupby('industry')['instrument'].nunique()
+            print(f"\n  📊 行业分布 (股票数):")
+            for industry, count in industry_dist.head(10).items():
+                print(f"     {industry}: {count}只")
+
+        except Exception as e:
+            print(f"  ⚠️  行业评分失败: {e}")
             factor_data['industry_rank'] = factor_data['position']
 
         return factor_data
@@ -703,5 +749,6 @@ __all__ = [
     'ICCalculator',
     'TimeSeriesSplitter',
     'IndustryBasedScorer',
-    'EnhancedStockSelector'
+    'EnhancedStockSelector',
+    'get_industry_data'
 ]
