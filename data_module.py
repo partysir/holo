@@ -1,20 +1,13 @@
 """
-data_module.py - 数据管理模块 (完整修复版 v2.4)
-修复 Tushare API 限流问题 + 保留所有原有功能
+data_module.py - 数据管理模块 (完整修复版 v2.5)
+修复 Tushare API 限流问题 + 保留所有原有功能 + 修复列索引错误
 
 主要改进:
+✅ 修复 KeyError: "['position', 'amount'] not in index"
+✅ get_price_data 返回 amount 列
+✅ load_data_from_tushare 正确分离价格列和因子列
 ✅ 智能限流控制 (自适应等待)
 ✅ 批量请求优化 (减少API调用次数)
-✅ 错误重试机制 (自动重试失败请求)
-✅ 保留所有因子列
-✅ 基本面数据支持
-✅ 行业数据支持
-
-使用前准备:
-1. 注册Tushare账号: https://tushare.pro/register
-2. 获取token: https://tushare.pro/user/token
-3. 安装: pip install tushare pandas numpy
-4. 设置token: 在main.py中添加 ts.set_token('你的token')
 """
 
 import pandas as pd
@@ -260,7 +253,7 @@ class TushareDataSource:
         if self.pro is None:
             return None
 
-        cache_name = f"price_{ts_code}_v2.4_{start_date.replace('-', '')}_{end_date.replace('-', '')}"
+        cache_name = f"price_{ts_code}_v2.5_{start_date.replace('-', '')}_{end_date.replace('-', '')}"
 
         if self.cache:
             cached_data = self.cache.load_from_cache(cache_name)
@@ -290,7 +283,8 @@ class TushareDataSource:
                     if pd.notna(list_date_dt):
                         df = df[df['date'] >= list_date_dt].copy()
 
-                result = df[['date', 'instrument', 'open', 'close', 'high', 'low', 'volume']]
+                # ✅ 修复: 添加 amount 列
+                result = df[['date', 'instrument', 'open', 'close', 'high', 'low', 'volume', 'amount']]
 
                 if self.cache:
                     self.cache.save_to_cache(result, cache_name)
@@ -429,7 +423,7 @@ class TushareDataSource:
         if self.pro is None:
             return pd.DataFrame({'instrument': instruments, 'industry': 'Unknown'})
 
-        cache_name = "industry_data_all_v2.4"
+        cache_name = "industry_data_all_v2.5"
         if use_cache and self.cache:
             cached_data = self.cache.load_from_cache(cache_name)
             if cached_data is not None:
@@ -668,17 +662,17 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
                            custom_weights=None, tushare_token=None,
                            use_fundamental=True, min_days_listed=180):
     """
-    从Tushare加载数据并计算因子 (完整优化版 v2.4)
+    从Tushare加载数据并计算因子 (完整优化版 v2.5)
     """
     print("\n" + "=" * 80)
-    print("📦 数据加载模块 (完整优化版 v2.4)")
+    print("📦 数据加载模块 (完整优化版 v2.5)")
     print("=" * 80)
 
     # 生成缓存Key
     model_suffix = "stockranker" if use_stockranker else "simple"
     if use_fundamental: model_suffix += "_fundamental"
-    cache_key = f"factor_data_ts_v2.4_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
-    price_cache_key = f"price_data_ts_v2.4_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
+    cache_key = f"factor_data_ts_v2.5_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
+    price_cache_key = f"price_data_ts_v2.5_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
 
     # 1. 尝试从缓存加载
     if use_cache and cache_manager:
@@ -760,11 +754,16 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
 
     result_factor = factor_df[essential_columns + factor_columns].copy()
 
-    # 价格数据保留基本面列
-    price_columns_to_keep = essential_columns + price_only_columns
+    # ✅ 修复: 价格数据不包含 position 列
+    # price_df 包含 'amount' (由 get_price_data 修复提供) 但不包含 'position'
+    price_columns_to_keep = ['date', 'instrument'] + price_only_columns
+
     if use_fundamental:
         for col in ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']:
             if col in price_df.columns: price_columns_to_keep.append(col)
+
+    # 过滤掉 price_df 中不存在的列
+    price_columns_to_keep = [col for col in price_columns_to_keep if col in price_df.columns]
 
     result_price = price_df[price_columns_to_keep].copy()
 
