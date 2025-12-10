@@ -1,14 +1,10 @@
 """
-factor_based_risk_control_optimized.py - 因子风控 + 最佳现金管理（完整集成版）
+factor_based_risk_control_optimized.py - 因子风控 + 最佳现金管理 + 择时模块
 
-核心特性：
-✅ 因子风控：用因子本身做风险控制
-✅ 最佳现金管理：动态等权 + 现金保留
-✅ 高资金利用率：~95%
-✅ 仓位均衡：每只股票金额相近
-
-版本：v2.0 - 完整集成优化版
-日期：2025-12-09
+核心改进：
+✅ 1. 择时模块：大盘均线择时，规避系统性风险
+✅ 2. 因子风控：用因子本身做风险控制
+✅ 3. 最佳现金管理：动态等权 + 现金保留
 """
 
 import pandas as pd
@@ -126,16 +122,19 @@ class OptimalCashManager:
 
 class FactorBasedRiskControlOptimized:
     """
-    因子风控 + 最佳现金管理（完整集成版）
+    因子风控 + 最佳现金管理 + 大盘择时 (完整集成版)
 
     核心改进：
     1. ✅ 因子风控：评分衰减、排名止损、行业轮动
     2. ✅ 最佳现金管理：动态等权 + 5%现金保留
-    3. ✅ 高资金利用率：~95%
-    4. ✅ 仓位均衡：每只股票金额相近
+    3. ✅ 择时模块：大盘均线择时，规避系统性风险
     """
 
     def __init__(self, factor_data, price_data,
+                 # ✨ 新增：基准数据（用于择时）
+                 benchmark_data=None,
+                 market_ma_period=60, # 60日均线择时
+
                  start_date='2023-01-01', end_date='2025-12-05',
                  capital_base=1000000, position_size=10,
                  rebalance_days=5,
@@ -169,6 +168,9 @@ class FactorBasedRiskControlOptimized:
 
         self.factor_data = factor_data
         self.price_data = price_data
+        self.benchmark_data = benchmark_data # 指数数据
+        self.market_ma_period = market_ma_period
+
         self.start_date = start_date
         self.end_date = end_date
         self.capital_base = capital_base
@@ -204,10 +206,13 @@ class FactorBasedRiskControlOptimized:
         )
 
         # 构建索引
-        print("\n  ⚡ 构建因子风控 + 最佳现金管理系统...")
+        print("\n  ⚡ 构建因子风控 + 最佳现金管理 + 择时系统...")
         self.price_dict = self._build_price_dict()
         self.factor_dict = self._build_factor_dict()
         self.trading_days = sorted(factor_data['date'].unique())
+
+        # 预计算大盘均线
+        self.market_signals = self._calculate_market_signals()
 
         # 行业信息
         if 'industry' in factor_data.columns:
@@ -227,8 +232,12 @@ class FactorBasedRiskControlOptimized:
         self.is_risk_mode = False
 
         print(f"  ✓ 系统初始化完成")
-        print(f"\n  【v2.0 完整集成版配置】")
+        print(f"\n  【v2.1 完整集成版配置】")
         print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if self.benchmark_data is not None:
+            print(f"  📈 择时模块: 已启用 ({market_ma_period}日均线)")
+        else:
+            print(f"  ⚠️  择时模块: 未启用 (无基准数据)")
         print(f"  💰 最佳现金管理:")
         print(f"     • 现金保留: {cash_reserve_ratio:.1%}")
         print(f"     • 资金利用率目标: {1 - cash_reserve_ratio:.1%}")
@@ -262,6 +271,36 @@ class FactorBasedRiskControlOptimized:
             if 'industry' in row:
                 industry_dict[str(row['date'])][row['instrument']] = row['industry']
         return dict(industry_dict)
+
+    def _calculate_market_signals(self):
+        """预计算大盘择时信号"""
+        signals = {}
+        if self.benchmark_data is None:
+            return signals
+
+        df = self.benchmark_data.copy()
+        df = df.sort_values('date')
+        # 计算移动平均线
+        df['ma'] = df['close'].rolling(window=self.market_ma_period).mean()
+
+        # 信号：Close > MA 为看多，否则看空
+        for _, row in df.iterrows():
+            date_str = str(row['date'])
+            if pd.notna(row['ma']):
+                signals[date_str] = row['close'] > row['ma']
+            else:
+                signals[date_str] = True # 默认看多
+
+        return signals
+
+    def check_market_regime(self, date_str):
+        """
+        检查市场状态
+        返回: True(市场健康/看多), False(市场风险/看空)
+        """
+        if not self.market_signals:
+            return True
+        return self.market_signals.get(date_str, True)
 
     # ========== 因子风控方法 ==========
 
@@ -533,7 +572,7 @@ class FactorBasedRiskControlOptimized:
         return False
 
     def rebalance(self, date):
-        """✨ 调仓（集成因子风控 + 最佳现金管理）"""
+        """✨ 调仓（集成因子风控 + 最佳现金管理 + 大盘择时）"""
         date_str = str(date)
         scores = self.factor_dict.get(date_str, {})
         prices = self.price_dict.get(date_str, {})
@@ -541,38 +580,46 @@ class FactorBasedRiskControlOptimized:
         if self.debug:
             print(f"\n{'=' * 80}")
             print(f"[调仓] {date_str}")
-            print(f"  调仓前: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
+            print(f"  当前持仓: {len(self.positions)}只")
+            print(f"  可用现金: ¥{self.cash:,.0f}")
 
-        # 1. 风险检查
+        # 1. 风险检查 (风控卖出始终执行，不受择时影响)
         risk_conditions = self.check_risk_conditions(date)
         for stock, reason in risk_conditions:
             self.execute_sell(date, stock, reason=reason)
 
-        if self.debug:
-            print(f"  风控后: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
+        # 2. 择时检查：如果大盘不好，只卖不买
+        is_market_good = self.check_market_regime(date_str)
+        if not is_market_good:
+            if self.debug:
+                print(f"  🛑 大盘择时: 市场处于下行趋势 (价格 < MA{self.market_ma_period})，暂停买入！")
 
-        # 2. 获取候选股票
+            # 在熊市中，可以选择只进行卖出操作，不再进行后续的买入逻辑
+            # 这里直接退出函数，不再执行买入
+            return
+
+        # 3. 获取候选股票
         if not scores:
             return
 
         sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         top_candidates = sorted_candidates[:50]
 
-        # 3. 评估现有持仓
+        # 4. 评估现有持仓
         to_sell = []
         for stock, info in list(self.positions.items()):
             in_top = any(stock == c[0] for c in top_candidates[:self.position_size])
             if not in_top:
                 to_sell.append(stock)
 
-        # 4. 先卖出释放资金
+        # 5. 先卖出释放资金
         for stock in to_sell:
             self.execute_sell(date, stock, reason='rebalance')
 
         if self.debug:
             print(f"  卖出后: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
 
-        # 5. 确定待买入股票
+        # 6. 确定待买入股票
         if self.is_risk_mode:
             target_size = int(self.position_size * self.reduce_position_ratio)
         else:
@@ -593,14 +640,14 @@ class FactorBasedRiskControlOptimized:
             ]
 
             if filtered_stocks:
-                # 6. ✨ 使用最佳现金管理计算买入计划
+                # 7. ✨ 使用最佳现金管理计算买入计划
                 buy_plan = self.cash_manager.calculate_buy_plan(
                     available_cash=self.cash,
                     target_stocks=filtered_stocks,
                     prices=prices
                 )
 
-                # 7. 批量执行买入
+                # 8. 批量执行买入
                 if buy_plan:
                     self.execute_buy_batch(date, buy_plan)
 
@@ -628,21 +675,21 @@ class FactorBasedRiskControlOptimized:
         """计算未实现盈亏"""
         date_str = str(date)
         prices = self.price_dict.get(date_str, {})
-        
+
         unrealized_pnl = 0
         for stock, info in self.positions.items():
             price = prices.get(stock, info['cost'])
             cost_basis = info['cost'] * info['shares']
             market_value = price * info['shares']
             unrealized_pnl += market_value - cost_basis
-            
+
         return unrealized_pnl
 
     def run(self, silent=False):
         """运行回测"""
         if not silent:
             print("\n" + "=" * 80)
-            print("⚡ 因子风控 + 最佳现金管理 v2.0")
+            print("⚡ 因子风控 + 最佳现金管理 + 大盘择时 v2.1")
             print("=" * 80)
 
         import time
@@ -692,7 +739,7 @@ class FactorBasedRiskControlOptimized:
 
         # 计算总盈亏明细
         total_realized_pnl = sell_trades['pnl'].sum() if len(sell_trades) > 0 else 0
-        
+
         return {
             'daily_records': df_records,
             'trade_records': df_trades,
@@ -705,15 +752,21 @@ class FactorBasedRiskControlOptimized:
 
 
 # ========== 便捷接口 ==========
-def run_factor_based_strategy_v2(factor_data, price_data, start_date, end_date,
+def run_factor_based_strategy_v2(factor_data, price_data,
+                                 # 新增：基准数据
+                                 benchmark_data=None,
+                                 # 原有参数
+                                 start_date='2023-01-01', end_date='2025-12-05',
                                  capital_base=1000000, position_size=10,
                                  rebalance_days=5, cash_reserve_ratio=0.05,
                                  **kwargs):
-    """运行因子风控 + 最佳现金管理策略（v2.0）"""
+    """运行因子风控 + 最佳现金管理策略（v2.1 含择时）"""
     engine = FactorBasedRiskControlOptimized(
         factor_data, price_data,
-        start_date, end_date, capital_base, position_size,
-        rebalance_days, cash_reserve_ratio, **kwargs
+        benchmark_data=benchmark_data, # 传入基准数据
+        start_date=start_date, end_date=end_date, capital_base=capital_base,
+        position_size=position_size, rebalance_days=rebalance_days,
+        cash_reserve_ratio=cash_reserve_ratio, **kwargs
     )
 
     return engine.run()

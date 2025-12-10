@@ -46,7 +46,7 @@ class BacktestConfig:
     CAPITAL_BASE = 1000000  # 初始资金
 
     # 持仓配置
-    POSITION_SIZE = 10  # 持仓数量
+    POSITION_SIZE = 5  # 持仓数量
     REBALANCE_DAYS = 5  # 调仓周期（天）
     POSITION_METHOD = 'equal'  # 仓位分配方法（v1.0使用）
 
@@ -113,7 +113,7 @@ class DataConfig:
 
     # 性能优化
     MAX_WORKERS = 10  # 并行线程数
-    FORCE_FULL_UPDATE = False  # 是否强制全量更新
+    FORCE_FULL_UPDATE = True  # 是否强制全量更新
 
 
 # ========== 因子配置 ==========

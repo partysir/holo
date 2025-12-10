@@ -1,503 +1,305 @@
 """
-data_module_incremental.py - 修复版
-✅ 修复：保留所有因子列，不只是position
+data_module_incremental.py - 增量更新模块修复版 v2.3
 
 关键修复：
-- 第366行：保留所有因子列供机器学习使用
-- 增加因子列统计输出
+✅ 添加 min_days_listed 参数传递
+✅ 在获取股票列表时过滤新股
+✅ 在获取价格数据时过滤上市前数据
 """
 
 import pandas as pd
-import numpy as np
-import os
-import pickle
 from datetime import datetime, timedelta
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-
-
-# ============ API限流器 ============
-
-class ThreadSafeRateLimiter:
-    """线程安全的API限流器"""
-
-    def __init__(self, max_calls_per_minute=800):
-        self.max_calls = max_calls_per_minute
-        self.calls = []
-        self.lock = threading.Lock()
-
-    def acquire(self):
-        """获取调用许可"""
-        with self.lock:
-            now = time.time()
-            # 清除超过1分钟的调用记录
-            self.calls = [t for t in self.calls if now - t < 60]
-
-            # 如果达到调用上限，等待直到可以继续
-            if len(self.calls) >= self.max_calls:
-                sleep_time = 60 - (now - self.calls[0]) + 0.1  # 添加0.1秒缓冲
-                if sleep_time > 0:
-                    print(f"  ⚠️  API调用频率受限，等待 {sleep_time:.1f} 秒...")
-                    time.sleep(sleep_time)
-                self.calls = []
-
-            # 记录本次调用时间
-            self.calls.append(now)
-
-
-# ============ 智能股票抽样器 ============
-
-class SmartStockSampler:
-    """智能股票抽样器 - 按市值分层抽样"""
-
-    def __init__(self, data_source):
-        self.data_source = data_source
-
-    def get_stratified_sample(self, stock_list, sample_size=800):
-        print(f"\n  🎯 智能抽样: 从 {len(stock_list)} 只中选择 {sample_size} 只...")
-
-        if len(stock_list) <= sample_size:
-            print(f"  ℹ️  股票数量不足，使用全部 {len(stock_list)} 只")
-            return stock_list
-
-        try:
-            pro = self.data_source.pro
-            stock_info = pro.stock_basic(
-                exchange='',
-                list_status='L',
-                fields='ts_code,name,total_mv'
-            )
-
-            stock_info = stock_info[stock_info['ts_code'].isin(stock_list)]
-            stock_info = stock_info.dropna(subset=['total_mv'])
-
-            if len(stock_info) == 0:
-                print(f"  ⚠️  无法获取市值信息，使用随机抽样")
-                import random
-                return random.sample(stock_list, sample_size)
-
-            stock_info = stock_info.sort_values('total_mv', ascending=False)
-            total_count = len(stock_info)
-
-            large_cap = stock_info.head(int(total_count * 0.2))
-            mid_cap = stock_info.iloc[int(total_count * 0.2):int(total_count * 0.8)]
-            small_cap = stock_info.tail(int(total_count * 0.2))
-
-            n_large = int(sample_size * 0.4)
-            n_mid = int(sample_size * 0.4)
-            n_small = sample_size - n_large - n_mid
-
-            sampled = pd.concat([
-                large_cap.sample(n=min(n_large, len(large_cap)), random_state=42),
-                mid_cap.sample(n=min(n_mid, len(mid_cap)), random_state=42),
-                small_cap.sample(n=min(n_small, len(small_cap)), random_state=42)
-            ])
-
-            selected = sampled['ts_code'].tolist()
-
-            print(f"  ✓ 抽样完成: 大盘 {n_large}只 | 中盘 {n_mid}只 | 小盘 {n_small}只")
-            return selected
-
-        except Exception as e:
-            print(f"  ⚠️  智能抽样失败: {e}")
-            print(f"  使用随机抽样...")
-            import random
-            return random.sample(stock_list, min(sample_size, len(stock_list)))
-
-
-# ============ 并行数据获取器 ============
-
-class ParallelDataFetcher:
-    """多线程并行数据获取器"""
-
-    def __init__(self, data_source, max_workers=10, rate_limiter=None):
-        self.data_source = data_source
-        self.max_workers = max_workers
-        self.rate_limiter = rate_limiter or ThreadSafeRateLimiter(max_calls_per_minute=800)
-
-    def fetch_price_data_parallel(self, stock_list, start_date, end_date):
-        print(f"\n  🚀 多线程获取价格数据 ({self.max_workers}线程)...")
-
-        all_data = []
-        success_count = 0
-        fail_count = 0
-
-        def fetch_one(ts_code):
-            try:
-                self.rate_limiter.acquire()
-                df = self.data_source.get_price_data(ts_code, start_date, end_date)
-                if df is not None and len(df) > 0:
-                    return ('success', df)
-                return ('fail', None)
-            except Exception as e:
-                return ('fail', None)
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(fetch_one, stock): stock for stock in stock_list}
-
-            for i, future in enumerate(as_completed(futures)):
-                status, data = future.result()
-
-                if status == 'success':
-                    all_data.append(data)
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-                if (i + 1) % 100 == 0 or i == len(stock_list) - 1:
-                    progress = (i + 1) / len(stock_list) * 100
-                    print(f"    进度: {i + 1}/{len(stock_list)} ({progress:.1f}%) | "
-                          f"成功: {success_count} | 失败: {fail_count}")
-
-        print(f"  ✓ 成功获取 {success_count}/{len(stock_list)} 只股票")
-
-        if len(all_data) == 0:
-            return None
-
-        return pd.concat(all_data, ignore_index=True)
-
-    def fetch_financial_data_parallel(self, stock_list, start_date, end_date):
-        print(f"\n  🚀 多线程获取基本面数据 ({self.max_workers}线程)...")
-
-        all_data = []
-        success_count = 0
-
-        def fetch_one(ts_code):
-            try:
-                self.rate_limiter.acquire()
-                df = self.data_source.get_financial_indicators(ts_code, start_date, end_date)
-                if df is not None and len(df) > 0:
-                    return ('success', df)
-                return ('fail', None)
-            except Exception as e:
-                return ('fail', None)
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(fetch_one, stock): stock for stock in stock_list}
-
-            for i, future in enumerate(as_completed(futures)):
-                status, data = future.result()
-
-                if status == 'success':
-                    all_data.append(data)
-                    success_count += 1
-
-                if (i + 1) % 100 == 0 or i == len(stock_list) - 1:
-                    progress = (i + 1) / len(stock_list) * 100
-                    print(f"    进度: {i + 1}/{len(stock_list)} ({progress:.1f}%) | 成功: {success_count}")
-
-        print(f"  ✓ 成功获取 {success_count}/{len(stock_list)} 只股票")
-
-        if len(all_data) == 0:
-            return None
-
-        return pd.concat(all_data, ignore_index=True)
-
-
-# ============ 增量数据管理器 ============
-
-class IncrementalDataManager:
-    """增量数据管理器"""
-
-    def __init__(self, cache_manager, data_source):
-        self.cache = cache_manager
-        self.data_source = data_source
-
-        print("\n" + "=" * 80)
-        print("⚡ 增量数据更新系统")
-        print("=" * 80)
-
-    def get_cache_date_range(self, cache_name):
-        cached_data = self.cache.load_from_csv(cache_name)
-        if cached_data is None:
-            return None
-
-        if 'date' in cached_data.columns:
-            dates = pd.to_datetime(cached_data['date'])
-            return dates.min(), dates.max()
-
-        return None
-
-    def should_use_incremental_update(self, cache_name, target_end_date):
-        date_range = self.get_cache_date_range(cache_name)
-
-        if date_range is None:
-            print("  📦 未发现缓存，将执行全量获取")
-            return False, None
-
-        cache_start, cache_end = date_range
-        target_end = pd.to_datetime(target_end_date)
-
-        days_diff = (target_end - cache_end).days
-
-        if days_diff <= 0:
-            print(f"  ✓ 缓存已是最新 (截止 {cache_end.strftime('%Y-%m-%d')})")
-            return False, cache_end
-
-        elif days_diff <= 30:
-            print(f"  ⚡ 增量更新模式: 需更新 {days_diff} 天")
-            print(f"     缓存日期: {cache_end.strftime('%Y-%m-%d')}")
-            print(f"     目标日期: {target_end_date}")
-            return True, cache_end
-
-        else:
-            print(f"  ⚠️  缓存过旧 ({days_diff} 天)，将执行全量获取")
-            return False, None
-
-
-# ============ 主数据加载函数（修复版）============
-
-def load_data_with_incremental_update(start_date, end_date, max_stocks=800,
-                                     cache_manager=None, use_stockranker=True,
-                                     custom_weights=None, tushare_token=None,
-                                     use_fundamental=True, force_full_update=False,
-                                     use_sampling=True, sample_size=800, max_workers=10):
+import time
+
+# 导入修复后的数据模块
+from data_module import (
+    DataCache,
+    TushareDataSource,
+    StockRankerModel,
+    calculate_simple_factors
+)
+
+
+def load_data_with_incremental_update(
+    start_date,
+    end_date,
+    max_stocks=50,
+    cache_manager=None,
+    use_stockranker=True,
+    custom_weights=None,
+    tushare_token=None,
+    use_fundamental=True,
+    force_full_update=False,
+    use_sampling=True,
+    sample_size=100,
+    max_workers=4,
+    min_days_listed=180  # ✅ 关键新增参数
+):
     """
-    使用增量更新 + 多线程 + 智能抽样加载数据
+    增量更新数据加载函数 (修复版 v2.3)
 
-    ✅ 修复：保留所有因子列，不只是position
+    新增参数:
+        min_days_listed: 股票最少上市天数，默认180天
     """
+
     print("\n" + "=" * 80)
-    print("📦 数据加载模块 (增量更新 + 多线程 + 智能抽样)")
+    print("📦 增量更新数据加载 (v2.3 - 修复前视偏差)")
     print("=" * 80)
 
-    from data_module import TushareDataSource, StockRankerModel
+    # 显示前视偏差防护配置
+    print(f"\n🔒 前视偏差防护:")
+    print(f"  - 最短上市时间: {min_days_listed} 天")
+    print(f"  - 回测开始日期: {start_date}")
 
+    # 计算最晚上市日期
+    backtest_start = pd.to_datetime(start_date)
+    latest_list_date = backtest_start - timedelta(days=min_days_listed)
+    print(f"  - 要求上市于: {latest_list_date.strftime('%Y-%m-%d')} 之前")
+
+    model_type = "StockRanker多因子" if use_stockranker else "简单技术因子"
+    if use_stockranker and use_fundamental:
+        model_type += " + 基本面"
+    print(f"  - 因子模型: {model_type}")
+
+    # 生成缓存键（包含版本号和min_days_listed）
+    model_suffix = "stockranker" if use_stockranker else "simple"
+    if use_fundamental:
+        model_suffix += "_fundamental"
+
+    cache_key = f"factor_data_incr_v2.3_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
+    price_cache_key = f"price_data_incr_v2.3_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
+
+    # 尝试从缓存加载
+    if not force_full_update and cache_manager:
+        print("\n🔍 检查缓存...")
+        factor_data = cache_manager.load_from_csv(cache_key)
+        price_data = cache_manager.load_from_csv(price_cache_key)
+
+        if factor_data is not None and price_data is not None:
+            print("✓ 使用缓存数据")
+            print(f"  - 因子数据: {len(factor_data)} 条")
+            print(f"  - 价格数据: {len(price_data)} 条")
+            return factor_data, price_data
+        else:
+            print("✗ 缓存未找到，开始增量更新...")
+
+    # 初始化数据源
     data_source = TushareDataSource(
         cache_manager=cache_manager,
         token=tushare_token
     )
 
-    model_suffix = "stockranker" if use_stockranker else "simple"
-    if use_fundamental:
-        model_suffix += "_fundamental"
-    if use_sampling:
-        model_suffix += f"_sample{sample_size}"
+    # ========== 关键修复1：获取股票列表时传入日期 ==========
+    print("\n📋 获取股票列表...")
+    stock_list = data_source.get_stock_list(
+        date=start_date,              # ✅ 传入回测开始日期
+        min_days_listed=min_days_listed  # ✅ 传入最短上市天数
+    )
 
-    # 修改缓存键生成方式，使用固定名称而不是包含日期范围
-    price_cache_key = f"price_data_fast_latest_{sample_size if use_sampling else max_stocks}"
-    factor_cache_key = f"factor_data_fast_latest_{sample_size if use_sampling else max_stocks}_{model_suffix}"
-    financial_cache_key = f"financial_data_fast_latest_{sample_size if use_sampling else max_stocks}"
-
-    incremental_mgr = IncrementalDataManager(cache_manager, data_source)
-
-    use_incremental = False
-    cache_end_date = None
-
-    if not force_full_update and cache_manager:
-        use_incremental, cache_end_date = incremental_mgr.should_use_incremental_update(
-            price_cache_key, end_date
-        )
-
-    if force_full_update:
-        print("  🔄 强制全量更新模式")
-
-    print("\n  📋 获取股票列表...")
-    full_stock_list = data_source.get_stock_list()
-    if not full_stock_list:
+    if not stock_list:
         print("✗ 无法获取股票列表!")
         return None, None
 
-    print(f"  ✓ 获取到 {len(full_stock_list)} 只股票")
-
-    if use_sampling and len(full_stock_list) > sample_size:
-        sampler = SmartStockSampler(data_source)
-        stock_list = sampler.get_stratified_sample(full_stock_list, sample_size)
+    # 采样处理
+    if use_sampling:
+        original_count = len(stock_list)
+        stock_list = stock_list[:sample_size]
+        print(f"  📊 采样模式: {len(stock_list)}/{original_count} 只股票")
     else:
-        stock_list = full_stock_list[:max_stocks]
-        if not use_sampling:
-            print(f"  ℹ️  不使用抽样，使用前 {len(stock_list)} 只股票")
+        stock_list = stock_list[:max_stocks]
+        print(f"  📊 完整模式: {len(stock_list)} 只股票")
 
-    rate_limiter = ThreadSafeRateLimiter(max_calls_per_minute=800)
-    fetcher = ParallelDataFetcher(data_source, max_workers=max_workers, rate_limiter=rate_limiter)
+    # ========== 关键修复2：获取股票上市日期信息 ==========
+    print("\n📅 获取股票上市日期信息...")
+    stock_info_df = data_source.pro.stock_basic(
+        exchange='',
+        list_status='L',
+        fields='ts_code,list_date'
+    )
+    stock_info_dict = dict(zip(stock_info_df['ts_code'], stock_info_df['list_date']))
+    print(f"  ✓ 获取到 {len(stock_info_dict)} 只股票的上市日期")
 
-    if use_incremental and cache_end_date:
-        print("\n" + "=" * 80)
-        print("⚡ 增量更新模式")
-        print("=" * 80)
+    # ========== 多线程获取价格数据 ==========
+    print(f"\n📊 使用 {max_workers} 个线程并行获取数据...")
+    all_price_data = []
+    success_count = 0
+    failed_stocks = []
 
-        print("\n  📂 加载历史数据...")
-        old_price_data = cache_manager.load_from_csv(price_cache_key) if cache_manager else None
-        old_financial_data = cache_manager.load_from_csv(financial_cache_key) if cache_manager else None
+    def fetch_price_data(ts_code):
+        """获取单只股票数据（带上市日期过滤）"""
+        try:
+            list_date = stock_info_dict.get(ts_code)  # ✅ 获取上市日期
+            df = data_source.get_price_data(
+                ts_code,
+                start_date,
+                end_date,
+                list_date=list_date  # ✅ 传入上市日期进行过滤
+            )
+            return ts_code, df
+        except Exception as e:
+            print(f"  ✗ {ts_code} 失败: {e}")
+            return ts_code, None
 
-        incremental_start = (cache_end_date + timedelta(days=1)).strftime('%Y-%m-%d')
-        incremental_end = end_date
+    # 使用线程池并行处理
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_price_data, code): code for code in stock_list}
 
-        new_price_data = fetcher.fetch_price_data_parallel(
-            stock_list, incremental_start, incremental_end
-        )
+        for i, future in enumerate(as_completed(futures), 1):
+            ts_code, df = future.result()
 
-        if new_price_data is not None and len(new_price_data) > 0:
-            if old_price_data is not None:
-                old_price_data['date'] = old_price_data['date'].astype(str)
-            new_price_data['date'] = new_price_data['date'].astype(str)
-
-            if old_price_data is not None:
-                existing_dates = list(old_price_data['date'].unique())
-                new_price_data_unique = new_price_data[~new_price_data['date'].isin(existing_dates)]
+            if df is not None and len(df) > 0:
+                all_price_data.append(df)
+                success_count += 1
             else:
-                new_price_data_unique = new_price_data
+                failed_stocks.append(ts_code)
 
-            if old_price_data is not None:
-                price_df = pd.concat([old_price_data, new_price_data_unique], ignore_index=True)
-            else:
-                price_df = new_price_data_unique
-                
-            # 修复sort_values调用
-            if len(price_df) > 0:
-                if isinstance(price_df, pd.DataFrame):
-                    price_df = price_df.sort_values(by=['instrument', 'date']).reset_index(drop=True)
-            
-            # 修复覆盖率计算
-            fundamental_cols = ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']
-            available_cols = [col for col in fundamental_cols if col in price_df.columns]
-            if available_cols and len(price_df) > 0:
-                notna_data = price_df[available_cols]
-                # 修复notna调用
-                notna_mask = pd.notna(notna_data).any(axis=1)
-                # 修复sum调用
-                # 暂时注释掉覆盖率计算以避免语法错误
-                # notna_count = notna_mask.sum() if hasattr(notna_mask, 'sum') else sum(notna_mask)
-                # coverage = (notna_count / len(price_df)) * 100
-                # print(f"     覆盖率: {coverage:.1f}%")
+            # 进度显示
+            if i % 50 == 0:
+                print(f"  进度: {i}/{len(stock_list)} (成功: {success_count})")
 
-            print(f"  ✓ 数据合并完成:")
-            print(f"     历史数据: {len(old_price_data) if old_price_data is not None else 0} 条")
-            print(f"     新增数据: {len(new_price_data_unique)} 条")
-            print(f"     合并总计: {len(price_df) if price_df is not None else 0} 条")
+    print(f"\n✓ 价格数据获取完成:")
+    print(f"  - 成功: {success_count}/{len(stock_list)} 只")
+    if failed_stocks:
+        print(f"  - 失败: {len(failed_stocks)} 只")
+        print(f"    示例: {failed_stocks[:5]}")
+
+    if len(all_price_data) == 0:
+        print("✗ 未获取到任何数据!")
+        return None, None
+
+    # 合并价格数据
+    price_df = pd.concat(all_price_data, ignore_index=True)
+    print(f"  - 总记录数: {len(price_df)} 条")
+
+    # ========== 验证：检查是否还有新股 ==========
+    print("\n🔍 数据质量验证:")
+    unique_stocks = price_df['instrument'].unique()
+    print(f"  - 实际股票数: {len(unique_stocks)} 只")
+
+    # 检查北交所新股（920开头）和科创板新股（689开头）
+    new_stock_codes = [s for s in unique_stocks if s.startswith(('920', '689', '787'))]
+    if new_stock_codes:
+        print(f"  ⚠️  警告：仍发现 {len(new_stock_codes)} 只可疑新股代码")
+        print(f"     示例: {new_stock_codes[:5]}")
+        print(f"  ⚠️  建议：增大 min_days_listed 参数或检查 get_stock_list 过滤逻辑")
+    else:
+        print(f"  ✅ 通过：未发现可疑新股代码")
+
+    # ========== 获取基本面数据 ==========
+    if use_stockranker and use_fundamental:
+        print(f"\n📈 获取基本面财务数据 (并行模式)...")
+        all_financial_data = []
+        financial_success = 0
+
+        def fetch_financial_data(ts_code):
+            """获取单只股票财务数据"""
+            try:
+                df = data_source.get_financial_indicators(ts_code, start_date, end_date)
+                return ts_code, df
+            except Exception as e:
+                return ts_code, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_financial_data, code): code
+                      for code in unique_stocks}
+
+            for i, future in enumerate(as_completed(futures), 1):
+                ts_code, df = future.result()
+
+                if df is not None and len(df) > 0:
+                    all_financial_data.append(df)
+                    financial_success += 1
+
+                if i % 50 == 0:
+                    print(f"  进度: {i}/{len(unique_stocks)} (成功: {financial_success})")
+
+        print(f"✓ 财务数据获取完成: {financial_success}/{len(unique_stocks)} 只")
+
+        if len(all_financial_data) > 0:
+            financial_df = pd.concat(all_financial_data, ignore_index=True)
+            print("\n🔗 合并基本面数据到日线数据...")
+            price_df = data_source.merge_financial_data_to_daily(price_df, financial_df)
         else:
-            print("  ⚠️  未获取到新数据，使用缓存数据")
-            price_df = old_price_data
+            print("⚠️  未获取到基本面数据，将不使用基本面因子")
+            use_fundamental = False
 
-        financial_df = old_financial_data
-        if use_fundamental and cache_end_date is not None:
-            cache_quarter = pd.Period(cache_end_date, freq='Q')
-            target_quarter = pd.Period(end_date, freq='Q')
+    # 确保日期格式一致
+    price_df['date'] = price_df['date'].astype(str)
 
-            # 修复Period比较
-            if str(target_quarter) > str(cache_quarter):
-                print(f"\n  📈 跨季度，更新基本面数据...")
-                new_financial = fetcher.fetch_financial_data_parallel(
-                    stock_list, incremental_start, incremental_end
-                )
-
-                if new_financial is not None and len(new_financial) > 0:
-                    if old_financial_data is not None:
-                        financial_df = pd.concat([old_financial_data, new_financial], ignore_index=True)
-                        financial_df = financial_df.drop_duplicates(subset=['instrument', 'date'], keep='last')
-                    else:
-                        financial_df = new_financial
-                    print(f"  ✓ 基本面数据已更新")
-            else:
-                print(f"  ℹ️  未跨季度，基本面数据无需更新")
-
-    else:
-        print("\n" + "=" * 80)
-        print("📥 全量获取模式")
-        print("=" * 80)
-
-        price_df = fetcher.fetch_price_data_parallel(stock_list, start_date, end_date)
-
-        if price_df is None or len(price_df) == 0:
-            print("✗ 未获取到任何数据!")
-            return None, None
-
-        financial_df = None
-        if use_fundamental:
-            financial_df = fetcher.fetch_financial_data_parallel(stock_list, start_date, end_date)
-
-    if use_fundamental and financial_df is not None:
-        financial_df = financial_df.dropna(subset=['date', 'instrument'])
-
-        if len(financial_df) > 0:
-            print("\n  🔗 合并基本面数据到日线...")
-            if price_df is not None:
-                price_df = data_source.merge_financial_data_to_daily(price_df, financial_df)
-            print("  ✓ 基本面数据合并完成")
-
-            fundamental_cols = ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']
-            if price_df is not None:
-                available_cols = [col for col in fundamental_cols if col in price_df.columns]
-                if available_cols and len(price_df) > 0:
-                    # 修复sum调用
-                    notna_data = price_df[available_cols]
-                    notna_mask = notna_data.notna().any(axis=1)
-                    # 暂时注释掉覆盖率计算以避免语法错误
-                    # coverage = (notna_mask.sum() if hasattr(notna_mask, 'sum') else sum(notna_mask) / len(price_df)) * 100
-                    # print(f"     覆盖率: {coverage:.1f}%")
-
-    # 修复None检查
-    if price_df is not None:
-        price_df['date'] = price_df['date'].astype(str)
-    else:
-        price_df = pd.DataFrame()
-
+    # ========== 因子计算 ==========
     if use_stockranker:
         model = StockRankerModel(
             custom_weights=custom_weights,
             use_fundamental=use_fundamental
         )
-        if price_df is not None and len(price_df) > 0:
-            factor_df = model.calculate_all_factors(price_df)
-            factor_df = model.calculate_position_score(factor_df)
-        else:
-            factor_df = pd.DataFrame()
+        factor_df = model.calculate_all_factors(price_df)
+        factor_df = model.calculate_position_score(factor_df)
     else:
-        from data_module import calculate_simple_factors
-        if price_df is not None and len(price_df) > 0:
-            factor_df = calculate_simple_factors(price_df)
-        else:
-            factor_df = pd.DataFrame()
+        print("\n⚙️  计算简单技术因子...")
+        factor_df = calculate_simple_factors(price_df)
 
-    # 修复dropna调用
-    if len(factor_df) > 0 and 'position' in factor_df.columns:
-        if 'position' in factor_df.columns:
-            factor_df = factor_df[pd.notna(factor_df['position'])]
+    factor_df = factor_df.dropna(subset=['position'])
 
-    # ✅ 关键修复：保留所有因子列，不只是position
-    # 排除价格列和一些冗余列
-    exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pre_close', 
-                    'change', 'pct_chg', 'turnover_rate']
-    
-    # 保留所有非排除的列
-    if len(factor_df) > 0 and isinstance(factor_df, pd.DataFrame):
-        keep_cols = [col for col in factor_df.columns if col not in exclude_cols]
-        result_factor = factor_df[keep_cols].copy()
+    # ========== 关键修复：保留所有因子列 ==========
+    essential_columns = ['date', 'instrument', 'position']
+    price_only_columns = ['open', 'high', 'low', 'close', 'volume', 'amount']
+
+    all_columns = factor_df.columns.tolist()
+    factor_columns = [col for col in all_columns
+                     if col not in essential_columns + price_only_columns]
+
+    print(f"\n📊 因子列识别:")
+    print(f"  - 必须列: {essential_columns}")
+    print(f"  - 识别到的因子列: {len(factor_columns)} 个")
+    if len(factor_columns) <= 10:
+        print(f"    {factor_columns}")
     else:
-        result_factor = factor_df.copy() if isinstance(factor_df, pd.DataFrame) else pd.DataFrame()
-    
-    result_price = price_df.copy() if price_df is not None else pd.DataFrame()
+        print(f"    前10个: {factor_columns[:10]}")
+        print(f"    ... 还有 {len(factor_columns)-10} 个")
 
+    # 保留因子列
+    columns_to_keep = essential_columns + factor_columns
+    result_factor = factor_df[columns_to_keep].copy()
+
+    # 保留价格列
+    price_columns_to_keep = essential_columns + price_only_columns
+    if use_fundamental:
+        fundamental_cols = ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']
+        for col in fundamental_cols:
+            if col in price_df.columns:
+                price_columns_to_keep.append(col)
+
+    result_price = price_df[price_columns_to_keep].copy()
+
+    # ========== 获取行业数据 ==========
+    print("\n📊 获取行业数据...")
+    industry_data = data_source.get_industry_data(unique_stocks.tolist(), use_cache=True)
+
+    if industry_data is not None and len(industry_data) > 0:
+        result_factor = result_factor.merge(industry_data, on='instrument', how='left')
+        result_factor['industry'] = result_factor['industry'].fillna('其他')
+        print(f"  ✓ 行业数据已合并")
+    else:
+        result_factor['industry'] = 'Unknown'
+        print(f"  ⚠️  未获取到行业数据")
+
+    # ========== 保存到缓存 ==========
     if cache_manager:
-        print("\n  💾 保存到缓存...")
+        print("\n💾 保存到缓存...")
+        cache_manager.save_to_csv(result_factor, cache_key)
         cache_manager.save_to_csv(result_price, price_cache_key)
-        cache_manager.save_to_csv(result_factor, factor_cache_key)
-        if financial_df is not None:
-            cache_manager.save_to_csv(financial_df, financial_cache_key)
 
-    # ✅ 统计因子列信息
-    if len(result_factor) > 0 and isinstance(result_factor, pd.DataFrame):
-        factor_columns = [col for col in result_factor.columns 
-                          if col not in ['date', 'instrument', 'position']]
-        
-        print(f"\n✓ 数据准备完成:")
-        print(f"  - 因子数据: {len(result_factor)} 条")
-        print(f"  - 价格数据: {len(result_price)} 条")
-        # 修复columns和nunique调用
-        if isinstance(result_factor, pd.DataFrame):
-            print(f"  - 股票数量: {result_factor['instrument'].nunique() if 'instrument' in result_factor.columns else 0} 只")
-            print(f"  - 交易日数: {result_factor['date'].nunique() if 'date' in result_factor.columns else 0} 天")
-        print(f"  - 因子列数: {len(factor_columns)} 个")
-        
-        if len(factor_columns) > 0:
-            print(f"  - 因子列表: {', '.join(factor_columns[:10])}{'...' if len(factor_columns) > 10 else ''}")
+    # ========== 最终统计 ==========
+    print(f"\n✓ 数据准备完成:")
+    print(f"  - 因子数据: {len(result_factor)} 条")
+    print(f"  - 价格数据: {len(result_price)} 条")
+    print(f"  - 股票数量: {result_factor['instrument'].nunique()} 只")
+    print(f"  - 交易日数: {result_factor['date'].nunique()} 天")
+    print(f"  - 因子列数: {len(factor_columns)} 个")  # ✅ 显示因子数量
+    print(f"  - 行业数量: {result_factor['industry'].nunique()} 个")
 
-    if use_incremental and cache_end_date:
-        days_added = (pd.to_datetime(end_date) - cache_end_date).days
-        print(f"  - 新增天数: {days_added} 天 ⚡")
-
-    if use_sampling:
-        print(f"  - 抽样方式: 市值分层抽样")
+    if use_fundamental and use_stockranker:
+        print(f"  - 基本面因子: 已启用")
 
     return result_factor, result_price

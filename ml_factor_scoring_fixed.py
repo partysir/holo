@@ -1,12 +1,12 @@
 """
-ml_factor_scoring_fixed.py - 高级机器学习因子评分模块（修复版）
+ml_factor_scoring_fixed.py - 高级机器学习因子评分模块（修复版 + 标签优化）
 
 核心优化：
 ✅ 1. 时间序列切分（避免前视偏差）
 ✅ 2. 分类目标（预测TOP 20%）
 ✅ 3. IC加权 - 因子有效性动态评估
 ✅ 4. 滚动训练 - 自适应市场变化
-✅ 5. Tushare行业数据集成
+✅ 5. 标签优化 - 使用超额收益（Active Return）
 """
 
 import pandas as pd
@@ -87,7 +87,7 @@ class ICCalculator:
 
         # 优化：预先过滤掉缺失值较多的数据
         merged_filtered = merged.dropna(subset=[price_col])
-        
+
         for factor in factor_columns:
             if factor not in merged_filtered.columns:
                 continue
@@ -100,20 +100,20 @@ class ICCalculator:
                 # 优化：一次性计算所有日期的IC，避免逐日循环
                 # 先过滤掉包含NaN的数据
                 valid_data = merged_filtered[[factor, return_col, 'date']].dropna()
-                
+
                 if len(valid_data) < 10:  # 至少10个样本
                     continue
-                
+
                 # 优化：使用向量化操作计算IC
                 # 按日期分组计算相关性
                 grouped = valid_data.groupby('date')
                 daily_ic_series = grouped.apply(
                     lambda x: x[factor].corr(x[return_col]) if len(x) >= 10 else np.nan
                 )
-                
+
                 # 过滤掉NaN值
                 daily_ic = daily_ic_series.dropna().tolist()
-                
+
                 if len(daily_ic) > 0:
                     ic_mean = np.mean(daily_ic)
                     ic_std = np.std(daily_ic)
@@ -291,6 +291,7 @@ class AdvancedMLScorer:
         ✅ 优化1: 避免前视偏差
         ✅ 优化2: 分类目标
         ✅ 优化3: IC特征
+        ✅ 优化4: 使用超额收益 (Active Return) 作为目标
         """
         print(f"\n📦 准备训练数据...")
 
@@ -322,22 +323,34 @@ class AdvancedMLScorer:
                     ic_value = ic_results[factor].get(self.target_period, {}).get('ic', 0)
                     merged[f'{factor}_ic'] = ic_value
 
-        # ===== 优化2: 计算目标变量 =====
+        # ===== 优化2: 计算超额收益目标 =====
         print(f"  ✓ 计算未来{self.target_period}日收益...")
-        merged['future_return'] = merged.groupby('instrument')[price_col].pct_change(
+
+        # 1. 计算绝对收益
+        merged['abs_return'] = merged.groupby('instrument')[price_col].pct_change(
             self.target_period
         ).shift(-self.target_period)
 
+        # 2. 计算市场平均收益 (作为基准)
+        print(f"  ✨ 计算超额收益 (Active Return)...")
+        # 使用当日所有股票的收益均值作为市场基准
+        market_return = merged.groupby('date')['abs_return'].transform('mean')
+
+        # 3. 计算超额收益 = 个股收益 - 市场均值
+        merged['future_return'] = merged['abs_return'] - market_return
+
         if self.use_classification:
-            # 分类目标：每天TOP 20%的股票标记为1
-            print(f"  ✓ 转换为分类目标 (TOP {self.top_percentile:.0%})...")
+            # 分类目标：每天超额收益 TOP N% 的股票标记为1
+            print(f"  ✓ 转换为分类目标 (超额收益 TOP {self.top_percentile:.0%})...")
             merged['target'] = 0
 
             for date in merged['date'].unique():
                 date_mask = merged['date'] == date
                 returns = merged.loc[date_mask, 'future_return']
-                threshold = returns.quantile(1 - self.top_percentile)
-                merged.loc[date_mask & (merged['future_return'] >= threshold), 'target'] = 1
+                # 只有当有足够数据时才计算分位数
+                if len(returns) > 5:
+                    threshold = returns.quantile(1 - self.top_percentile)
+                    merged.loc[date_mask & (merged['future_return'] >= threshold), 'target'] = 1
 
             target_col = 'target'
         else:
@@ -353,13 +366,17 @@ class AdvancedMLScorer:
             print(f"  ✓ 正样本比例: {pos_rate:.2%}")
 
         # ===== 构建特征 =====
+        # 排除非特征列，包括中间变量 abs_return
         base_exclude = [
-            'date', 'instrument', 'future_return', 'target', price_col,
-            'industry', 'ml_score', 'industry_rank', 'year_month'
+            'date', 'instrument', 'future_return', 'abs_return', 'target', price_col,
+            'industry', 'ml_score', 'industry_rank', 'year_month', 'position'
         ]
 
         all_cols = merged.columns.tolist()
         feature_cols = [col for col in all_cols if col not in base_exclude]
+
+        # 确保只使用数值型特征
+        feature_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(merged[c])]
 
         # 处理只有position的情况
         if len(feature_cols) == 0 and 'position' in merged.columns:
@@ -584,6 +601,7 @@ class AdvancedMLScorer:
     def predict_scores(self, factor_data, price_data=None, factor_columns=None):
         """预测评分"""
         if price_data is not None:
+            # 在预测阶段也使用超额收益作为目标进行训练
             X, y, merged = self.prepare_training_data(factor_data, price_data, factor_columns)
             self.train_walk_forward(X, y, merged, verbose=False)
             factor_data = merged.copy()
@@ -591,9 +609,11 @@ class AdvancedMLScorer:
         if self.model is None:
             raise ValueError("模型未训练")
 
-        print(f"\n🎯 预测股票评分...")
+        print(f"\n🎯 预测股票评分 (基于超额收益模型)...")
 
-        X = factor_data[self.feature_names].copy()
+        # 确保只使用训练时用到的特征
+        valid_features = [c for c in self.feature_names if c in factor_data.columns]
+        X = factor_data[valid_features].copy()
         X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
 
         X_scaled = self.scaler.transform(X)
