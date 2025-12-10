@@ -21,64 +21,74 @@ class EnhancedFactorProcessor:
         self.neutralize_industry = neutralize_industry
         self.neutralize_market = neutralize_market
         self.scaler = StandardScaler()
-        
+
     def process_factors(self, factor_data, factor_columns):
+        """处理因子（修复版）"""
+        print(f"    开始因子处理...")
+
+        # 过滤有效因子
+        valid_factors = []
+        for col in factor_columns:
+            if col in factor_data.columns:
+                if pd.api.types.is_numeric_dtype(factor_data[col]):
+                    valid_factors.append(col)
+
+        print(f"      有效因子列: {len(valid_factors)} 个")
+
+        if len(valid_factors) == 0:
+            return factor_data
+
+        # ===== 行业中性化 =====
+        # 只有当数据中已经存在industry列时才进行行业中性化
+        if self.neutralize_industry and 'industry' in factor_data.columns:
+            # 检查industry列是否有效
+            unique_industries = factor_data['industry'].nunique()
+            if unique_industries > 1:  # 至少有2个不同行业
+                print(f"      ✓ 检测到有效行业数据: {unique_industries}个行业")
+                print(f"      执行行业中性化...")
+                factor_data = self._neutralize_by_industry(factor_data, valid_factors)
+            else:
+                print(f"      ⚠️  行业数据不足（只有{unique_industries}个行业），跳过行业中性化")
+        elif self.neutralize_industry:
+            print(f"      ⚠️  已启用行业中性化，但缺少行业数据")
+
+        # ===== 市场中性化 =====
+        if self.neutralize_market:
+            print(f"      执行市场中性化...")
+            factor_data = self._neutralize_by_market(factor_data, valid_factors)
+
+        print(f"    因子处理完成: {len(valid_factors)} 个因子")
+
+        return factor_data
+    
+    def _neutralize_by_market(self, data, factor_columns):
         """
-        处理因子数据
+        市场中性化
         
         Args:
-            factor_data: 因子数据DataFrame
+            data: 数据DataFrame
             factor_columns: 因子列名列表
             
         Returns:
-            处理后的因子数据
+            中性化后的数据
         """
-        print("    开始因子处理...")
+        neutralized_data = data.copy()
         
-        processed_data = factor_data.copy()
-        
-        # 验证因子列是否存在且为数值型
-        valid_factor_columns = []
         for col in factor_columns:
-            if col not in processed_data.columns:
-                print(f"      ⚠️  列 '{col}' 不存在，跳过")
+            if col not in neutralized_data.columns:
                 continue
             
-            # 检查是否为数值列
             try:
-                if pd.api.types.is_numeric_dtype(processed_data[col]):
-                    valid_factor_columns.append(col)
-                else:
-                    print(f"      ⚠️  列 '{col}' 不是数值类型，跳过")
+                # 按日期去均值（市场中性化）
+                neutralized_data[col] = neutralized_data.groupby('date')[col].transform(
+                    lambda x: x - x.mean() if len(x) > 0 else x
+                )
             except Exception as e:
-                print(f"      ⚠️  检查列 '{col}' 失败: {e}")
+                print(f"      ⚠️  市场中性化失败 ({col}): {e}")
                 continue
         
-        if len(valid_factor_columns) == 0:
-            print("      ⚠️  没有有效的数值因子列")
-            return processed_data
-        
-        print(f"      有效因子列: {len(valid_factor_columns)} 个")
-        
-        for col in valid_factor_columns:
-            # 1. 缺失值处理（先处理，避免后续计算出现问题）
-            processed_data[col] = self._fill_missing_values(processed_data, col)
-            
-            # 2. 去极值
-            processed_data[col] = self._winsorize_mad(processed_data[col])
-            
-            # 3. 标准化
-            processed_data[col] = self._standardize_zscore(processed_data[col])
-        
-        # 4. 行业中性化
-        if self.neutralize_industry and 'industry' in processed_data.columns:
-            processed_data = self._neutralize_by_industry(processed_data, valid_factor_columns)
-        else:
-            if self.neutralize_industry:
-                print("      ⚠️  缺少行业数据，跳过行业中性化")
-        
-        print(f"    因子处理完成: {len(valid_factor_columns)} 个因子")
-        return processed_data
+        print("      市场中性化完成")
+        return neutralized_data
     
     def _winsorize_mad(self, series, n=3):
         """

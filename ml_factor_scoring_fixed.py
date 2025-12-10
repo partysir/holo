@@ -56,7 +56,7 @@ class ICCalculator:
 
     def calculate_factor_ic(self, factor_data, price_data, factor_columns):
         """
-        计算所有因子的IC值
+        计算所有因子的IC值（优化版）
 
         返回: {factor: {period: {'ic': float, 'icir': float}}}
         """
@@ -85,8 +85,11 @@ class ICCalculator:
 
         ic_results = {}
 
+        # 优化：预先过滤掉缺失值较多的数据
+        merged_filtered = merged.dropna(subset=[price_col])
+        
         for factor in factor_columns:
-            if factor not in merged.columns:
+            if factor not in merged_filtered.columns:
                 continue
 
             ic_results[factor] = {}
@@ -94,23 +97,23 @@ class ICCalculator:
             for period in self.forward_periods:
                 return_col = f'future_return_{period}d'
 
-                # 按日期分组计算IC
-                daily_ic = []
-                for date in merged['date'].unique():
-                    date_data = merged[merged['date'] == date]
-
-                    # 过滤有效数据
-                    valid_data = date_data[[factor, return_col]].dropna()
-
-                    if len(valid_data) < 10:  # 至少10个样本
-                        continue
-
-                    # 计算相关性
-                    ic = valid_data[factor].corr(valid_data[return_col])
-
-                    if not np.isnan(ic):
-                        daily_ic.append(ic)
-
+                # 优化：一次性计算所有日期的IC，避免逐日循环
+                # 先过滤掉包含NaN的数据
+                valid_data = merged_filtered[[factor, return_col, 'date']].dropna()
+                
+                if len(valid_data) < 10:  # 至少10个样本
+                    continue
+                
+                # 优化：使用向量化操作计算IC
+                # 按日期分组计算相关性
+                grouped = valid_data.groupby('date')
+                daily_ic_series = grouped.apply(
+                    lambda x: x[factor].corr(x[return_col]) if len(x) >= 10 else np.nan
+                )
+                
+                # 过滤掉NaN值
+                daily_ic = daily_ic_series.dropna().tolist()
+                
                 if len(daily_ic) > 0:
                     ic_mean = np.mean(daily_ic)
                     ic_std = np.std(daily_ic)

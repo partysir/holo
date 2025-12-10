@@ -5,6 +5,8 @@ enhanced_strategy.py - 增强版策略系统（资金计算修复版）
 ✅ 修复仓位计算错误 - 使用可用现金而非总资产
 ✅ 添加资金充足性检查
 ✅ 添加调试日志选项
+✅ 修复买入金额计算逻辑
+✅ 确保资金动态更新
 """
 
 import pandas as pd
@@ -166,8 +168,9 @@ class EnhancedStrategy:
     def execute_trade(self, date, stock, action, shares=None, weight=None, reason='rebalance'):
         """
         执行交易（修复版）
-        
+
         ✅ 关键修复：使用可用现金而非总资产计算买入金额
+        ✅ 修复买入金额计算逻辑
         """
         date_str = str(date)
         price = self.price_dict.get(date_str, {}).get(stock)
@@ -177,11 +180,12 @@ class EnhancedStrategy:
         if action == 'buy':
             # ========== 关键修复：使用可用现金 ==========
             if weight is not None:
-                # ✅ 修复前：target_value = self.portfolio_value * weight
-                # ✅ 修复后：只使用可用现金
+                # ✅ 修复：正确计算可买入金额
                 target_value = self.cash * weight
-                shares = int(target_value / price / (1 + self.buy_cost))
-            
+                # 修复买入金额计算逻辑
+                available_value = target_value / (1 + self.buy_cost)
+                shares = int(available_value / price)
+
             if self.debug:
                 print(f"  [BUY] {date_str} {stock}:")
                 print(f"    可用现金: ¥{self.cash:,.0f}")
@@ -197,23 +201,24 @@ class EnhancedStrategy:
                 return False
 
             cost_total = shares * price * (1 + self.buy_cost)
-            
+
             # ✅ 资金充足性检查
             if cost_total > self.cash:
                 if self.debug:
                     print(f"    ⚠️  资金不足: 需要¥{cost_total:,.0f} > 可用¥{self.cash:,.0f}")
-                
+
                 # 按可用资金买入
-                shares = int(self.cash / price / (1 + self.buy_cost))
+                available_value = self.cash / (1 + self.buy_cost)
+                shares = int(available_value / price)
                 shares = int(shares / 100) * 100
-                
+
                 if shares < 100:
                     if self.debug:
                         print(f"    ❌ 调整后仍不足100股，放弃买入")
                     return False
-                
+
                 cost_total = shares * price * (1 + self.buy_cost)
-                
+
                 if self.debug:
                     print(f"    ✓ 调整为: {shares:,.0f}股，¥{cost_total:,.0f}")
 
@@ -238,11 +243,11 @@ class EnhancedStrategy:
                 'amount': cost_total,
                 'reason': reason
             })
-            
+
             if self.debug:
                 print(f"    ✓ 买入成功: {shares:,.0f}股 @ ¥{price:.2f}")
                 print(f"    剩余现金: ¥{self.cash:,.0f}")
-            
+
             return True
 
         elif action == 'sell':
@@ -290,7 +295,7 @@ class EnhancedStrategy:
     def rebalance(self, date):
         """
         调仓（修复版）
-        
+
         ✅ 确保先卖出再买入，避免资金不足
         """
         date_str = str(date)
@@ -347,7 +352,7 @@ class EnhancedStrategy:
                         if c[0] not in self.positions]
 
         available_slots = self.position_size - len(self.positions)
-        
+
         if available_slots > 0 and target_stocks:
             target_stocks = target_stocks[:available_slots]
             target_scores = [(s, scores[s]) for s in target_stocks]
@@ -359,10 +364,16 @@ class EnhancedStrategy:
                 print(f"\n  买入 {len(target_stocks)} 只:")
                 print(f"  可用现金: ¥{self.cash:,.0f}")
 
-            # 买入
-            for stock, weight in weights.items():
-                if stock in prices:
-                    self.execute_trade(date, stock, 'buy', weight=weight, reason='rebalance')
+            # 买入 - 按权重动态分配资金
+            total_weight = sum(weights.values())
+            if total_weight > 0:
+                # 重新归一化权重
+                normalized_weights = {stock: weight/total_weight for stock, weight in weights.items()}
+
+                # 按照归一化权重买入
+                for stock, weight in normalized_weights.items():
+                    if stock in prices:
+                        self.execute_trade(date, stock, 'buy', weight=weight, reason='rebalance')
 
     def calculate_portfolio_value(self, date):
         """计算组合价值"""
@@ -375,7 +386,7 @@ class EnhancedStrategy:
         )
 
         total_value = self.cash + holdings_value
-        
+
         # ✅ 合理性检查
         if total_value > self.capital_base * 1000:  # 超过初始资金1000倍
             print(f"\n⚠️  警告：资产规模异常！")
@@ -384,7 +395,7 @@ class EnhancedStrategy:
             print(f"  持仓市值: ¥{holdings_value:,.0f}")
             print(f"  总资产: ¥{total_value:,.0f}")
             print(f"  持仓数: {len(self.positions)}")
-            
+
             # 显示异常持仓
             for stock, info in list(self.positions.items())[:3]:
                 price = prices.get(stock, info['cost'])

@@ -40,24 +40,24 @@ class FactorBasedRiskControl:
                  # ========== 基于因子的风控参数 ==========
 
                  # 1. 因子衰减止损
-                 enable_score_decay_stop=True,  # 启用评分衰减止损
-                 score_decay_threshold=0.30,  # 评分下降30%止损
-                 min_holding_days=5,  # 最少持有5天（避免过早止损）
+                 enable_score_decay_stop=True,    # 启用评分衰减止损
+                 score_decay_threshold=0.30,      # 评分下降30%止损
+                 min_holding_days=5,              # 最少持有5天（避免过早止损）
 
                  # 2. 相对排名止损
-                 enable_rank_stop=True,  # 启用排名止损
+                 enable_rank_stop=True,           # 启用排名止损
                  rank_percentile_threshold=0.70,  # 跌出前70%止损
 
                  # 3. 组合层面风控
-                 max_portfolio_drawdown=-0.15,  # 组合回撤-15%降仓
-                 reduce_position_ratio=0.5,  # 降仓到50%
+                 max_portfolio_drawdown=-0.15,    # 组合回撤-15%降仓
+                 reduce_position_ratio=0.5,       # 降仓到50%
 
                  # 4. 行业风控
-                 enable_industry_rotation=True,  # 启用行业轮动
-                 max_industry_weight=0.40,  # 单行业最大40%
+                 enable_industry_rotation=True,   # 启用行业轮动
+                 max_industry_weight=0.40,        # 单行业最大40%
 
                  # 5. 极端情况保护
-                 extreme_loss_threshold=-0.20,  # 单股极端亏损-20%
+                 extreme_loss_threshold=-0.20,    # 单股极端亏损-20%
                  portfolio_loss_threshold=-0.25,  # 组合极端亏损-25%
 
                  # 其他参数
@@ -325,7 +325,7 @@ class FactorBasedRiskControl:
 
     def check_risk_conditions(self, date):
         """
-        ✅ 综合风险检查（基于因子）
+        ✅ 综合风险检查（增强版 - 修复长期持有亏损问题）
         """
         date_str = str(date)
         scores = self.factor_dict.get(date_str, {})
@@ -339,26 +339,36 @@ class FactorBasedRiskControl:
                 continue
 
             holding_days = (pd.to_datetime(date_str) -
-                            pd.to_datetime(info['entry_date'])).days
+                          pd.to_datetime(info['entry_date'])).days
 
             current_score = scores.get(stock, 0.5)
+            pnl_rate = (price - info['cost']) / info['cost']
 
             # 1. 因子衰减止损
-            if self.check_score_decay_stop(stock, current_score, info, holding_days):
-                to_sell.append((stock, 'score_decay'))
-                continue
+            if self.enable_score_decay_stop:
+                if self.check_score_decay_stop(stock, current_score, info, holding_days):
+                    to_sell.append((stock, 'score_decay'))
+                    continue
 
             # 2. 相对排名止损
-            if self.check_rank_stop(stock, date_str, scores):
-                to_sell.append((stock, 'rank_stop'))
+            if self.enable_rank_stop:
+                if self.check_rank_stop(stock, date_str, scores):
+                    to_sell.append((stock, 'rank_stop'))
+                    continue
+
+            # 3. ✅ 新增：长期持有亏损检查（持有>30天且亏损>10%）
+            if holding_days >= 30 and pnl_rate < -0.10:
+                to_sell.append((stock, 'long_hold_loss'))
+                if self.debug:
+                    print(f"    长期持有亏损: {stock} (持有{holding_days}天, 亏损{pnl_rate:.2%})")
                 continue
 
-            # 3. 极端亏损保护
+            # 4. 极端亏损保护
             if self.check_extreme_loss(stock, price, info):
                 to_sell.append((stock, 'extreme_loss'))
                 continue
 
-        # 4. 组合回撤控制
+        # 5. 组合回撤控制
         in_risk_mode = self.check_portfolio_drawdown()
 
         if in_risk_mode:
@@ -376,8 +386,9 @@ class FactorBasedRiskControl:
             if stocks_to_reduce > 0:
                 for stock, _ in current_positions[:stocks_to_reduce]:
                     if (stock, 'score_decay') not in to_sell and \
-                            (stock, 'rank_stop') not in to_sell and \
-                            (stock, 'extreme_loss') not in to_sell:
+                       (stock, 'rank_stop') not in to_sell and \
+                       (stock, 'long_hold_loss') not in to_sell and \
+                       (stock, 'extreme_loss') not in to_sell:
                         to_sell.append((stock, 'risk_mode_reduce'))
 
         return to_sell
@@ -391,7 +402,7 @@ class FactorBasedRiskControl:
         return False
 
     def execute_trade(self, date, stock, action, weight=None, reason='rebalance'):
-        """执行交易"""
+        """执行交易（完全修复版）"""
         date_str = str(date)
         price = self.price_dict.get(date_str, {}).get(stock)
         if not price:
@@ -403,27 +414,58 @@ class FactorBasedRiskControl:
                 return False
 
             if weight is not None:
-                target_value = self.cash * weight
+                # ✅ 关键修复：确保目标金额不超过可用现金
+                target_value = min(self.cash * weight, self.cash * 0.95)  # 最多用95%现金
                 shares = int(target_value / price / (1 + self.buy_cost))
             else:
                 return False
 
+            # ✅ A股整百股
             shares = int(shares / 100) * 100
 
             if shares < 100:
+                if self.debug:
+                    print(f"    ❌ {stock}: 股数不足100股 ({shares}股)")
                 return False
 
+            # ✅ 计算总成本
             cost_total = shares * price * (1 + self.buy_cost)
 
+            # ✅ 严格检查资金
             if cost_total > self.cash:
-                shares = int(self.cash / price / (1 + self.buy_cost))
+                if self.debug:
+                    print(f"    ⚠️  {stock}: 资金不足")
+                    print(f"       需要: ¥{cost_total:,.0f}, 可用: ¥{self.cash:,.0f}")
+
+                # 按可用现金重新计算
+                shares = int((self.cash * 0.95) / price / (1 + self.buy_cost))
                 shares = int(shares / 100) * 100
+
                 if shares < 100:
+                    if self.debug:
+                        print(f"    ❌ {stock}: 调整后仍不足100股")
                     return False
+
                 cost_total = shares * price * (1 + self.buy_cost)
 
+                # 最终检查
+                if cost_total > self.cash:
+                    if self.debug:
+                        print(f"    ❌ {stock}: 最终检查失败，放弃买入")
+                    return False
+
+            # ✅ 执行买入
             self.cash -= cost_total
             score = self.factor_dict.get(date_str, {}).get(stock, 0.5)
+
+            # ✅ 验证：现金不能为负
+            if self.cash < 0:
+                print(f"    🚨 严重错误：现金为负 ¥{self.cash:,.0f}")
+                print(f"       股票: {stock}")
+                print(f"       股数: {shares:,.0f}")
+                print(f"       成本: ¥{cost_total:,.0f}")
+                self.cash += cost_total  # 回滚
+                return False
 
             self.positions[stock] = {
                 'shares': shares,
@@ -441,6 +483,10 @@ class FactorBasedRiskControl:
                 'amount': cost_total,
                 'reason': reason
             })
+
+            if self.debug:
+                print(f"    ✓ 买入 {stock}: {shares:,.0f}股 @ ¥{price:.2f}, 成本¥{cost_total:,.0f}")
+                print(f"      剩余现金: ¥{self.cash:,.0f}")
 
             return True
 
@@ -470,7 +516,7 @@ class FactorBasedRiskControl:
                 'reason': reason,
                 'entry_date': info['entry_date'],
                 'holding_days': (pd.to_datetime(date_str) -
-                                 pd.to_datetime(info['entry_date'])).days
+                               pd.to_datetime(info['entry_date'])).days
             })
 
             del self.positions[stock]
@@ -479,17 +525,21 @@ class FactorBasedRiskControl:
         return False
 
     def rebalance(self, date):
-        """调仓"""
+        """调仓（完全修复版）"""
         date_str = str(date)
         scores = self.factor_dict.get(date_str, {})
 
         if self.debug:
             print(f"\n[调仓] {date_str}")
+            print(f"  调仓前: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
 
         # 1. 风险检查（基于因子）
         risk_conditions = self.check_risk_conditions(date)
         for stock, reason in risk_conditions:
             self.execute_trade(date, stock, 'sell', reason=reason)
+
+        if self.debug:
+            print(f"  风控后: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
 
         # 2. 获取候选股票
         if not scores:
@@ -508,8 +558,12 @@ class FactorBasedRiskControl:
             if not in_top:
                 to_sell.append(stock)
 
+        # ✅ 关键：先卖出释放资金
         for stock in to_sell:
             self.execute_trade(date, stock, 'sell', reason='rebalance')
+
+        if self.debug:
+            print(f"  卖出后: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
 
         # 4. 买入新股票
         # 风险模式下减少仓位
@@ -519,16 +573,42 @@ class FactorBasedRiskControl:
             target_size = self.position_size
 
         target_stocks = [c[0] for c in top_candidates[:target_size]
-                         if c[0] not in self.positions]
+                        if c[0] not in self.positions]
 
         available_slots = target_size - len(self.positions)
 
         if available_slots > 0 and target_stocks:
             target_stocks = target_stocks[:available_slots]
-            weight = 1.0 / len(target_stocks)
 
-            for stock in target_stocks:
-                self.execute_trade(date, stock, 'buy', weight=weight, reason='rebalance')
+            if self.debug:
+                print(f"  准备买入: {len(target_stocks)}只")
+                print(f"  可用现金: ¥{self.cash:,.0f}")
+
+            # ✅ 关键修复：动态计算每只股票的权重
+            # 方法：剩余现金 / 剩余待买入数量
+            stocks_bought = 0
+            for i, stock in enumerate(target_stocks):
+                remaining_stocks = len(target_stocks) - i  # 剩余待买入数量
+                weight = 1.0 / remaining_stocks  # 从剩余股票中平均分配
+
+                if self.debug:
+                    print(f"    [{i+1}/{len(target_stocks)}] {stock}: 权重{weight:.2%} (剩余{remaining_stocks}只)")
+
+                success = self.execute_trade(date, stock, 'buy', weight=weight, reason='rebalance')
+
+                if success:
+                    stocks_bought += 1
+                    if self.debug:
+                        print(f"      ✓ 买入成功, 剩余现金¥{self.cash:,.0f}")
+                else:
+                    if self.debug:
+                        print(f"      ✗ 买入失败")
+
+            if self.debug:
+                print(f"  买入完成: {stocks_bought}/{len(target_stocks)}只")
+
+        if self.debug:
+            print(f"  调仓后: 现金¥{self.cash:,.0f}, 持仓{len(self.positions)}只")
 
     def calculate_portfolio_value(self, date):
         """计算组合价值"""

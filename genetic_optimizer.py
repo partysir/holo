@@ -422,7 +422,7 @@ def main():
     print("\n【步骤1/4】加载数据")
 
     START_DATE = "2023-01-01"
-    END_DATE = "2025-12-07"
+    END_DATE = "2025-12-10"
     SAMPLE_SIZE = 3923
 
     cache_manager = DataCache(cache_dir='./data_cache')

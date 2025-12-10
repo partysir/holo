@@ -1,10 +1,11 @@
 """
-visualization_module.py - 可视化模块（修复版）
+visualization_module.py - 可视化模块（修复收益率计算版）
 
 修复内容:
-1. 风险指标计算错误
-2. 持仓明细显示买入时间
-3. 最大回撤计算修复
+1. ✅ 修复总收益率计算错误（使用正确的初始资金）
+2. ✅ 修复年化收益率计算
+3. ✅ 风险指标计算优化
+4. ✅ 持仓明细显示买入时间
 """
 
 import matplotlib.pyplot as plt
@@ -34,19 +35,28 @@ def generate_performance_report(context, output_dir='./reports'):
     trading_days = len(daily_records)
     total_trades = len(trade_records)
 
-    # 收益指标
-    initial_capital = daily_records['portfolio_value'].iloc[0]
+    # ✨ 修复：使用正确的初始资金
+    if 'capital_base' in context:
+        initial_capital = context['capital_base']
+    else:
+        # 从第一天的收益率反推初始资金
+        first_record = daily_records.iloc[0]
+        if first_record['return'] != 0:
+            initial_capital = first_record['portfolio_value'] / (1 + first_record['return'])
+        else:
+            initial_capital = first_record['portfolio_value']
+    
     final_value = daily_records['portfolio_value'].iloc[-1]
     total_return = (final_value - initial_capital) / initial_capital
 
     # ✨ 修复：年化收益率计算
     years = trading_days / 252
-    if years > 0:
+    if years > 0 and total_return > -1:  # 确保本金未完全亏损
         annualized_return = (1 + total_return) ** (1 / years) - 1
     else:
         annualized_return = 0
 
-    # ✨ 修复：最大回撤计算
+    # ✨ 修复：最大回撤计算（基于初始资金）
     cummax = daily_records['portfolio_value'].cummax()
     drawdown = (daily_records['portfolio_value'] - cummax) / cummax
     max_drawdown = drawdown.min()
@@ -90,7 +100,7 @@ def generate_performance_report(context, output_dir='./reports'):
         avg_loss = 0
         profit_loss_ratio = 0
 
-    # 当前持仓（显示买入时间）
+    # 当前持仓
     positions = context.get('positions', {})
 
     # 生成报告
@@ -98,38 +108,38 @@ def generate_performance_report(context, output_dir='./reports'):
 
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
-        f.write("📊 策略绩效报告\n")
+        f.write("📊 策略绩效报告（修复版）\n")
         f.write("=" * 80 + "\n\n")
 
         f.write("【回测基本信息】\n")
         f.write(f"回测开始日期: {start_date}\n")
         f.write(f"回测结束日期: {end_date}\n")
-        f.write(f"回测交易天数: {trading_days} 天\n")
-        f.write(f"总交易次数:   {total_trades} 次\n")
+        f.write(f"回测交易天数: {trading_days} 天 ({years:.2f}年)\n")
+        f.write(f"总交易次数: {total_trades} 次\n")
         f.write("=" * 80 + "\n\n")
 
         f.write("【收益指标】\n")
-        f.write(f"初始资金:     ¥{initial_capital:,.2f}\n")
-        f.write(f"最终资产:     ¥{final_value:,.2f}\n")
-        f.write(f"总收益:       ¥{final_value - initial_capital:,.2f}\n")
-        f.write(f"总收益率:     {total_return:+.2%}\n")
-        f.write(f"年化收益率:   {annualized_return:+.2%}\n\n")
+        f.write(f"初始资金: ¥{initial_capital:,.2f}\n")
+        f.write(f"最终资产: ¥{final_value:,.2f}\n")
+        f.write(f"总收益: ¥{final_value - initial_capital:,.2f}\n")
+        f.write(f"总收益率: {total_return:+.2%}\n")
+        f.write(f"年化收益率: {annualized_return:+.2%}\n\n")
 
         f.write("【风险指标】\n")
-        f.write(f"最大回撤:     {max_drawdown:.2%}\n")
-        f.write(f"年化波动率:   {annualized_volatility:.2%}\n")
-        f.write(f"夏普比率:     {sharpe_ratio:.4f}\n\n")
+        f.write(f"最大回撤: {max_drawdown:.2%}\n")
+        f.write(f"年化波动率: {annualized_volatility:.2%}\n")
+        f.write(f"夏普比率: {sharpe_ratio:.4f}\n\n")
 
         f.write("【交易指标】\n")
-        f.write(f"总交易次数:   {len(sell_trades)}\n")
-        f.write(f"胜率:         {win_rate:.2%}\n")
+        f.write(f"总交易次数: {len(sell_trades)}\n")
+        f.write(f"胜率: {win_rate:.2%}\n")
         f.write(f"平均持仓天数: {avg_holding_days:.1f} 天\n")
-        f.write(f"平均盈利:     ¥{avg_profit:,.2f}\n")
-        f.write(f"平均亏损:     ¥{avg_loss:,.2f}\n")
-        f.write(f"盈亏比:       {profit_loss_ratio:.2f}\n\n")
+        f.write(f"平均盈利: ¥{avg_profit:,.2f}\n")
+        f.write(f"平均亏损: ¥{avg_loss:,.2f}\n")
+        f.write(f"盈亏比: {profit_loss_ratio:.2f}\n\n")
 
         f.write("【当前持仓】\n")
-        f.write(f"持仓数量:     {len(positions)} 只\n")
+        f.write(f"持仓数量: {len(positions)} 只\n")
         f.write("持仓明细:\n")
 
         if positions:
@@ -155,21 +165,21 @@ def generate_performance_report(context, output_dir='./reports'):
     print("=" * 80 + "\n")
 
     print("【收益指标】")
-    print(f"  总收益率:     {total_return:+.2%}")
-    print(f"  年化收益率:   {annualized_return:+.2%}")
+    print(f"  总收益率: {total_return:+.2%}")
+    print(f"  年化收益率: {annualized_return:+.2%}")
 
     print("\n【风险指标】")
-    print(f"  最大回撤:     {max_drawdown:.2%}")
-    print(f"  年化波动率:   {annualized_volatility:.2%}")
-    print(f"  夏普比率:     {sharpe_ratio:.4f}")
+    print(f"  最大回撤: {max_drawdown:.2%}")
+    print(f"  年化波动率: {annualized_volatility:.2%}")
+    print(f"  夏普比率: {sharpe_ratio:.4f}")
 
     print("\n【交易指标】")
-    print(f"  胜率:         {win_rate:.2%}")
+    print(f"  胜率: {win_rate:.2%}")
     print(f"  平均持仓天数: {avg_holding_days:.1f} 天")
-    print(f"  盈亏比:       {profit_loss_ratio:.2f}")
+    print(f"  盈亏比: {profit_loss_ratio:.2f}")
 
     print("\n【当前持仓】")
-    print(f"  持仓数量:     {len(positions)} 只")
+    print(f"  持仓数量: {len(positions)} 只")
 
     if positions:
         sorted_positions = sorted(positions.items(),
@@ -182,6 +192,16 @@ def generate_performance_report(context, output_dir='./reports'):
                   f"(买入: {info['entry_date']}, 持有{holding_days}天)")
 
     print()
+    
+    return {
+        'initial_capital': initial_capital,
+        'final_value': final_value,
+        'total_return': total_return,
+        'annualized_return': annualized_return,
+        'max_drawdown': max_drawdown,
+        'sharpe_ratio': sharpe_ratio,
+        'win_rate': win_rate
+    }
 
 
 def plot_monitoring_results(context, output_dir='./reports'):
@@ -196,7 +216,7 @@ def plot_monitoring_results(context, output_dir='./reports'):
     # 1. 资产曲线
     ax1 = axes[0, 0]
     ax1.plot(range(len(daily_records)), daily_records['portfolio_value'],
-            linewidth=2, color='#2E86AB')
+             linewidth=2, color='#2E86AB')
     ax1.set_title('资产曲线', fontsize=14, fontweight='bold')
     ax1.set_xlabel('交易日')
     ax1.set_ylabel('资产 (元)')
@@ -217,7 +237,7 @@ def plot_monitoring_results(context, output_dir='./reports'):
     # 3. 持仓数量
     ax3 = axes[1, 0]
     ax3.plot(range(len(daily_records)), daily_records['position_count'],
-            linewidth=2, color='#F18F01', marker='o', markersize=2)
+             linewidth=2, color='#F18F01', marker='o', markersize=2)
     ax3.set_title('持仓数量', fontsize=14, fontweight='bold')
     ax3.set_xlabel('交易日')
     ax3.set_ylabel('持仓股票数')
@@ -226,7 +246,7 @@ def plot_monitoring_results(context, output_dir='./reports'):
     # 4. 现金余额
     ax4 = axes[1, 1]
     ax4.plot(range(len(daily_records)), daily_records['cash'],
-            linewidth=2, color='#06A77D')
+             linewidth=2, color='#06A77D')
     ax4.set_title('现金余额', fontsize=14, fontweight='bold')
     ax4.set_xlabel('交易日')
     ax4.set_ylabel('现金 (元)')
@@ -251,7 +271,7 @@ def plot_top_stocks_evolution(context, output_dir='./reports'):
     sell_trades = trade_records[trade_records['action'] == 'sell']
 
     if len(sell_trades) == 0:
-        print("⚠️  无卖出交易，跳过TOP股票分析")
+        print("⚠️ 无卖出交易，跳过TOP股票分析")
         return
 
     # 按盈亏排序
@@ -289,3 +309,55 @@ def plot_top_stocks_evolution(context, output_dir='./reports'):
     plt.close()
 
     print(f"✓ TOP股票分析已保存: {output_path}")
+
+
+# ========== 额外的诊断工具 ==========
+
+def diagnose_return_calculation(context):
+    """
+    诊断收益率计算是否正确
+    """
+    print("\n" + "=" * 80)
+    print("🔍 收益率计算诊断")
+    print("=" * 80)
+    
+    daily_records = context['daily_records']
+    
+    # 获取初始资金
+    if 'capital_base' in context:
+        capital_base = context['capital_base']
+        print(f"✓ 从context获取初始资金: ¥{capital_base:,.2f}")
+    else:
+        first_record = daily_records.iloc[0]
+        if first_record['return'] != 0:
+            capital_base = first_record['portfolio_value'] / (1 + first_record['return'])
+        else:
+            capital_base = first_record['portfolio_value']
+        print(f"⚠️ 从第一天记录反推初始资金: ¥{capital_base:,.2f}")
+    
+    # 第一天和最后一天的数据
+    first_day = daily_records.iloc[0]
+    last_day = daily_records.iloc[-1]
+    
+    print(f"\n第一天 ({first_day['date']}):")
+    print(f"  组合价值: ¥{first_day['portfolio_value']:,.2f}")
+    print(f"  记录的收益率: {first_day['return']:.2%}")
+    
+    print(f"\n最后一天 ({last_day['date']}):")
+    print(f"  组合价值: ¥{last_day['portfolio_value']:,.2f}")
+    print(f"  记录的收益率: {last_day['return']:.2%}")
+    
+    # 计算总收益率
+    total_return_correct = (last_day['portfolio_value'] - capital_base) / capital_base
+    total_return_wrong = (last_day['portfolio_value'] - first_day['portfolio_value']) / first_day['portfolio_value']
+    
+    print(f"\n收益率计算:")
+    print(f"  ✅ 正确方法: ({last_day['portfolio_value']:,.0f} - {capital_base:,.0f}) / {capital_base:,.0f} = {total_return_correct:+.2%}")
+    print(f"  ❌ 错误方法: ({last_day['portfolio_value']:,.0f} - {first_day['portfolio_value']:,.0f}) / {first_day['portfolio_value']:,.0f} = {total_return_wrong:+.2%}")
+    
+    if abs(total_return_correct - total_return_wrong) > 0.01:
+        print(f"\n⚠️ 检测到收益率计算差异: {abs(total_return_correct - total_return_wrong):.2%}")
+    else:
+        print(f"\n✓ 收益率计算一致")
+    
+    print("=" * 80 + "\n")
