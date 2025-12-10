@@ -1,10 +1,11 @@
 """
-factor_based_risk_control_optimized.py - 因子风控 + 最佳现金管理 + 择时模块
+factor_based_risk_control_optimized.py - 因子风控 + 最佳现金管理 + 择时模块 (修复版)
 
 核心改进：
 ✅ 1. 择时模块：大盘均线择时，规避系统性风险
 ✅ 2. 因子风控：用因子本身做风险控制
 ✅ 3. 最佳现金管理：动态等权 + 现金保留
+✅ 4. 修复调仓逻辑：首日立即调仓 + 强制换仓机制
 """
 
 import pandas as pd
@@ -228,11 +229,12 @@ class FactorBasedRiskControlOptimized:
         self.max_portfolio_value = capital_base
         self.daily_records = []
         self.trade_records = []
-        self.days_since_rebalance = 0
+        # ✅ 修改：初始化为 rebalance_days，确保第一天就触发调仓
+        self.days_since_rebalance = rebalance_days
         self.is_risk_mode = False
 
         print(f"  ✓ 系统初始化完成")
-        print(f"\n  【v2.1 完整集成版配置】")
+        print(f"\n  【v2.2 完整集成版配置】")
         print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         if self.benchmark_data is not None:
             print(f"  📈 择时模块: 已启用 ({market_ma_period}日均线)")
@@ -447,6 +449,16 @@ class FactorBasedRiskControlOptimized:
             if self.check_rank_stop(stock, date_str, scores):
                 to_sell.append((stock, 'rank_stop'))
                 continue
+
+            # ========== ✅ 新增：强制流动性换仓 ==========
+            # 如果持有超过 2 个调仓周期（比如10天）且收益微薄或亏损，强制卖出
+            # 这能强制策略“动起来”，避免死拿僵尸股
+            if holding_days >= (self.rebalance_days * 2) and pnl_rate < 0.02:
+                to_sell.append((stock, 'force_turnover'))
+                if self.debug:
+                    print(f"    ♻️ 强制换仓: {stock} (持有{holding_days}天, 收益{pnl_rate:.2%} < 2%)")
+                continue
+            # ==========================================
 
             # 3. 长期持有亏损检查
             if holding_days >= 30 and pnl_rate < -0.10:

@@ -369,6 +369,8 @@ def main():
         print("="*80)
 
         strategy_params = get_strategy_params()
+        # 添加调仓周期参数
+        strategy_params['rebalance_days'] = REBALANCE_DAYS
 
         # 运行回测
         context = run_factor_based_strategy_v2(

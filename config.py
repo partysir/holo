@@ -72,7 +72,7 @@ class RiskControlConfig:
 
     # 2. 相对排名止损
     ENABLE_RANK_STOP = True  # 启用相对排名止损
-    RANK_PERCENTILE_THRESHOLD = 0.70  # 跌出前70%止损
+    RANK_PERCENTILE_THRESHOLD = 0.80  # 跌出前70%止损
 
     # 3. 组合回撤保护
     MAX_PORTFOLIO_DRAWDOWN = -0.15  # 组合回撤-15%降仓
@@ -83,7 +83,7 @@ class RiskControlConfig:
     MAX_INDUSTRY_WEIGHT = 0.40  # 单行业最大40%
 
     # 5. 极端亏损保护
-    EXTREME_LOSS_THRESHOLD = -0.20  # 单股极端亏损-20%
+    EXTREME_LOSS_THRESHOLD = -0.10  # 单股极端亏损-20%
     PORTFOLIO_LOSS_THRESHOLD = -0.25  # 组合极端亏损-25%
 
 

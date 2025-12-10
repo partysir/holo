@@ -85,9 +85,12 @@ def load_data_with_incremental_update(
             print("✗ 缓存未找到，开始增量更新...")
 
     # 初始化数据源
+    from data_module import RateLimiter
+    rate_limiter = RateLimiter(max_calls=800, time_window=60)
     data_source = TushareDataSource(
         cache_manager=cache_manager,
-        token=tushare_token
+        token=tushare_token,
+        rate_limiter=rate_limiter
     )
 
     # ========== 关键修复1：获取股票列表时传入日期 ==========

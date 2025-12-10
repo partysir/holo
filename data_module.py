@@ -1,6 +1,6 @@
 """
-data_module.py - 数据管理模块 (完整修复版 v2.5)
-修复 Tushare API 限流问题 + 保留所有原有功能 + 修复列索引错误
+data_module.py - 数据管理模块 (完整修复版 v2.6)
+修复 Tushare API 限流问题 + 保留所有原有功能 + 修复列索引错误 + 过滤ST股票
 
 主要改进:
 ✅ 修复 KeyError: "['position', 'amount'] not in index"
@@ -8,6 +8,7 @@ data_module.py - 数据管理模块 (完整修复版 v2.5)
 ✅ load_data_from_tushare 正确分离价格列和因子列
 ✅ 智能限流控制 (自适应等待)
 ✅ 批量请求优化 (减少API调用次数)
+✅ 新增: 自动过滤 ST/S*ST/*ST 股票
 """
 
 import pandas as pd
@@ -123,13 +124,13 @@ class DataCache:
 
 
 class RateLimiter:
-    """智能限流控制器 - 防止触发API频率限制"""
+    """访问频率控制器 - 每分钟800次访问限制后暂停等待"""
 
-    def __init__(self, max_calls=700, time_window=60):
+    def __init__(self, max_calls=800, time_window=60):
         """
         初始化限流器
         Args:
-            max_calls: 时间窗口内最大调用次数 (默认700/分钟，留20%安全余量)
+            max_calls: 时间窗口内最大调用次数 (默认800/分钟)
             time_window: 时间窗口(秒)
         """
         self.max_calls = max_calls
@@ -139,7 +140,7 @@ class RateLimiter:
         self.total_waits = 0
 
     def wait_if_needed(self):
-        """如果需要则等待 - 确保不超过频率限制"""
+        """等待直到可以继续调用API - 确保不超过频率限制"""
         now = time.time()
 
         # 移除时间窗口外的记录
@@ -147,22 +148,25 @@ class RateLimiter:
             self.call_times.popleft()
 
         # 如果达到限制，等待到最早的调用超出时间窗口
-        if len(self.call_times) >= self.max_calls:
+        while len(self.call_times) >= self.max_calls:
             sleep_time = self.time_window - (now - self.call_times[0]) + 0.1
             if sleep_time > 0:
                 self.total_waits += 1
+                print(f"⏳ 触发访问限制，等待 {sleep_time:.1f} 秒...")
                 time.sleep(sleep_time)
                 now = time.time()
                 # 清理过期记录
                 while self.call_times and now - self.call_times[0] > self.time_window:
                     self.call_times.popleft()
+            else:
+                break
 
         # 记录本次调用
         self.call_times.append(now)
         self.total_calls += 1
 
         # 基础延迟(避免瞬时高峰)
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     def get_stats(self):
         """获取统计信息"""
@@ -197,12 +201,12 @@ class TushareDataSource:
             self.pro = None
 
         # 初始化限流器
-        self.rate_limiter = rate_limiter or RateLimiter(max_calls=700, time_window=60)
+        self.rate_limiter = rate_limiter or RateLimiter(max_calls=800, time_window=60)
         print(f"✓ 限流器已启用: {self.rate_limiter.max_calls}次/分钟")
 
     def get_stock_list(self, date=None, min_days_listed=180):
         """
-        获取股票列表 (修复版 - 增加上市日期过滤)
+        获取股票列表 (修复版 - 增加上市日期过滤和ST过滤)
         """
         if self.pro is None:
             return []
@@ -211,6 +215,7 @@ class TushareDataSource:
             print("使用Tushare获取股票列表...")
             self.rate_limiter.wait_if_needed()
 
+            # 确保 fields 中包含 'name' 以便过滤 ST
             df = self.pro.stock_basic(
                 exchange='',
                 list_status='L',
@@ -228,6 +233,13 @@ class TushareDataSource:
                 filtered_count = original_count - len(df)
 
                 print(f"  📅 上市日期过滤: 回测开始 {date}, 过滤新股 {filtered_count} 只")
+
+            # ========== 关键修复: 过滤 ST 股票 ==========
+            if 'name' in df.columns:
+                original_count = len(df)
+                df = df[~df['name'].str.contains('ST', case=False, na=False)].copy()
+                st_filtered = original_count - len(df)
+                print(f"  🗑️ ST股票过滤: 剔除 {st_filtered} 只风险警示股")
 
             # 过滤特殊板块
             original_count = len(df)
@@ -684,7 +696,7 @@ def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
             return factor_data, price_data
 
     # 2. 初始化数据源
-    rate_limiter = RateLimiter(max_calls=700, time_window=60)
+    rate_limiter = RateLimiter(max_calls=800, time_window=60)
     data_source = TushareDataSource(
         cache_manager=cache_manager if use_cache else None,
         token=tushare_token,
