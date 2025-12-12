@@ -108,6 +108,12 @@ def get_today_holdings(context, factor_data, price_data):
     if not df.empty and 'score' in df.columns:
         df = df.sort_values('score', ascending=False).reset_index(drop=True)
     
+    # 计算总持仓市值
+    if not df.empty:
+        total_value = df['current_value'].sum()
+        # 添加持仓占比列
+        df['position_ratio'] = df['current_value'] / total_value if total_value > 0 else 0
+    
     return df
 
 
@@ -125,7 +131,7 @@ def print_today_holdings_console(holdings_df, context):
     last_record = daily_records.iloc[-1]
     
     print(f"\n📅 今日日期: {last_record['date']}")
-    print("=" * 120)
+    print("=" * 130)
 
     # 账户概览
     total_value = holdings_df['current_value'].sum()
@@ -153,39 +159,32 @@ def print_today_holdings_console(holdings_df, context):
     print(f"  持平: {flat_count} 只")
 
     # 详细持仓列表
-    print(f"\n{'=' * 120}")
-    header = f"{'排名':4s} {'股票代码':12s} {'买入日期':12s} {'持有':4s} "
-    header += f"{'成本价':>8s} {'现价':>8s} {'盈亏':>10s} {'收益率':>8s} "
-    header += f"{'市值':>12s}"
+    print(f"\n{'=' * 130}")
+    header = f"{'排名':4s} {'股票代码':12s} {'买入日期':12s} {'持仓股数':>8s} "
+    header += f"{'持仓占比':>8s} {'成本价':>8s} {'现价':>8s} {'浮动盈亏':>10s} {'收益率':>8s} "
     if 'score' in holdings_df.columns:
-        header += f" {'评分':>8s}"
-    header += f" {'状态':6s}"
+        header += f"{'评分':>8s}"
     print(header)
-    print(f"{'=' * 120}")
+    print(f"{'=' * 130}")
 
     for idx, row in holdings_df.iterrows():
         rank = idx + 1
 
         if row['pnl'] > 0:
-            status = "📈盈利"
             pnl_color = "+"
         elif row['pnl'] < 0:
-            status = "📉亏损"
             pnl_color = ""
         else:
-            status = "⚪持平"
             pnl_color = " "
 
-        line = f"{rank:3d}  {row['stock']:12s} {row['entry_date']:12s} {row['holding_days']:3d}天 "
-        line += f"{row['cost']:8.2f} {row['current_price']:8.2f} "
+        line = f"{rank:3d}  {row['stock']:12s} {row['entry_date']:12s} {row['shares']:8.0f} "
+        line += f"{row['position_ratio']:7.2%} {row['cost']:8.2f} {row['current_price']:8.2f} "
         line += f"{pnl_color}¥{row['pnl']:9,.0f} {pnl_color}{row['pnl_rate']:7.2%} "
-        line += f"¥{row['current_value']:11,.0f}"
         if 'score' in holdings_df.columns:
-            line += f" {row['score']:7.4f}"
-        line += f" {status}"
+            line += f"{row['score']:7.4f}"
         print(line)
 
-    print(f"{'=' * 120}\n")
+    print(f"{'=' * 130}\n")
 
     # 关键持仓提示
     print("💡 关键持仓提示:")

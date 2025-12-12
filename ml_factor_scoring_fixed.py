@@ -1,12 +1,11 @@
 """
-ml_factor_scoring_fixed.py - 高级机器学习因子评分模块（修复版 + 标签优化）
+ml_factor_scoring_ultra.py - 超级优化版（提高实盘胜率）
 
-核心优化：
-✅ 1. 时间序列切分（避免前视偏差）
-✅ 2. 分类目标（预测TOP 20%）
-✅ 3. IC加权 - 因子有效性动态评估
-✅ 4. 滚动训练 - 自适应市场变化
-✅ 5. 标签优化 - 使用超额收益（Active Return）
+🎯 四大核心优化：
+✅ 1. 数据隔离 (Purging & Embargoing) - 消除信息泄露
+✅ 2. 特征正交化 (Feature Orthogonalization) - 提取纯Alpha
+✅ 3. 模型集成 (Ensemble Voting) - 降低过拟合
+✅ 4. 精准目标 (Precision@K Focus) - 优化Top选股
 """
 
 import pandas as pd
@@ -14,12 +13,10 @@ import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
-# 机器学习库
 try:
     import xgboost as xgb
     XGBOOST_AVAILABLE = True
 except ImportError:
-    print("⚠️  XGBoost 未安装，运行: pip install xgboost")
     xgb = None
     XGBOOST_AVAILABLE = False
 
@@ -27,193 +24,53 @@ try:
     import lightgbm as lgb
     LIGHTGBM_AVAILABLE = True
 except ImportError:
-    print("⚠️  LightGBM 未安装，运行: pip install lightgbm")
     lgb = None
     LIGHTGBM_AVAILABLE = False
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
+from sklearn.linear_model import LinearRegression
 
 
 # ============================================================================
-# 核心优化1: IC计算器
+# 优化1: 数据隔离器 (Purging & Embargoing)
 # ============================================================================
 
-class ICCalculator:
+class PurgingEmbargoSplitter:
     """
-    因子IC（信息系数）计算器
+    数据隔离切分器
 
-    IC = 因子值与未来收益的相关性
-    ICIR = IC的均值 / IC的标准差（夏普比率的因子版）
-    """
+    核心思想：
+    - Purging: 删除训练集末尾与验证集有重叠的样本
+    - Embargo: 在训练集和验证集之间加入Gap（隔离期）
 
-    def __init__(self, forward_periods=[5, 10, 20]):
-        """
-        :param forward_periods: 计算IC的未来周期列表
-        """
-        self.forward_periods = forward_periods
-        self.ic_history = {}  # {factor: {period: [ic_values]}}
-
-    def calculate_factor_ic(self, factor_data, price_data, factor_columns):
-        """
-        计算所有因子的IC值（优化版）
-
-        返回: {factor: {period: {'ic': float, 'icir': float}}}
-        """
-        print("\n📊 计算因子IC...")
-
-        # 检测价格列
-        price_col = self._detect_price_column(price_data)
-        if price_col is None:
-            print("  ⚠️  未找到价格列，跳过IC计算")
-            return {}
-
-        # 合并数据
-        merged = factor_data.merge(
-            price_data[['instrument', 'date', price_col]],
-            on=['instrument', 'date'],
-            how='left'
-        )
-
-        merged = merged.sort_values(['instrument', 'date'])
-
-        # 计算不同周期的未来收益
-        for period in self.forward_periods:
-            merged[f'future_return_{period}d'] = merged.groupby('instrument')[price_col].pct_change(
-                period
-            ).shift(-period)
-
-        ic_results = {}
-
-        # 优化：预先过滤掉缺失值较多的数据
-        merged_filtered = merged.dropna(subset=[price_col])
-
-        for factor in factor_columns:
-            if factor not in merged_filtered.columns:
-                continue
-
-            ic_results[factor] = {}
-
-            for period in self.forward_periods:
-                return_col = f'future_return_{period}d'
-
-                # 优化：一次性计算所有日期的IC，避免逐日循环
-                # 先过滤掉包含NaN的数据
-                valid_data = merged_filtered[[factor, return_col, 'date']].dropna()
-
-                if len(valid_data) < 10:  # 至少10个样本
-                    continue
-
-                # 优化：使用向量化操作计算IC
-                # 按日期分组计算相关性
-                grouped = valid_data.groupby('date')
-                daily_ic_series = grouped.apply(
-                    lambda x: x[factor].corr(x[return_col]) if len(x) >= 10 else np.nan
-                )
-
-                # 过滤掉NaN值
-                daily_ic = daily_ic_series.dropna().tolist()
-
-                if len(daily_ic) > 0:
-                    ic_mean = np.mean(daily_ic)
-                    ic_std = np.std(daily_ic)
-                    icir = ic_mean / ic_std if ic_std > 0 else 0
-
-                    ic_results[factor][period] = {
-                        'ic': ic_mean,
-                        'icir': icir,
-                        'ic_std': ic_std,
-                        'sample_days': len(daily_ic)
-                    }
-
-                    # 记录历史
-                    if factor not in self.ic_history:
-                        self.ic_history[factor] = {}
-                    self.ic_history[factor][period] = daily_ic
-
-        # 打印IC统计
-        self._print_ic_summary(ic_results)
-
-        return ic_results
-
-    def _detect_price_column(self, df):
-        """检测价格列"""
-        candidates = ['close', 'Close', 'CLOSE', 'price', 'Price']
-        for col in candidates:
-            if col in df.columns:
-                return col
-        return None
-
-    def _print_ic_summary(self, ic_results):
-        """打印IC统计"""
-        print(f"\n  📈 因子IC统计:")
-        print(f"  {'因子':<20s} | {'IC(5日)':<10s} | {'IC(10日)':<10s} | {'IC(20日)':<10s} | {'ICIR(5日)':<10s}")
-        print(f"  {'-'*80}")
-
-        for factor, periods in ic_results.items():
-            ic_5 = periods.get(5, {}).get('ic', 0)
-            ic_10 = periods.get(10, {}).get('ic', 0)
-            ic_20 = periods.get(20, {}).get('ic', 0)
-            icir_5 = periods.get(5, {}).get('icir', 0)
-
-            print(f"  {factor:<20s} | {ic_5:>9.4f} | {ic_10:>9.4f} | {ic_20:>9.4f} | {icir_5:>9.4f}")
-
-    def get_ic_weights(self, ic_results, period=5):
-        """
-        根据IC计算因子权重
-
-        权重 = abs(IC) / sum(abs(IC))
-        """
-        weights = {}
-        total_ic = 0
-
-        for factor, periods in ic_results.items():
-            ic = periods.get(period, {}).get('ic', 0)
-            weights[factor] = abs(ic)
-            total_ic += abs(ic)
-
-        if total_ic > 0:
-            weights = {k: v/total_ic for k, v in weights.items()}
-
-        return weights
-
-
-# ============================================================================
-# 核心优化2: 时间序列切分器
-# ============================================================================
-
-class TimeSeriesSplitter:
-    """
-    时间序列数据切分器
-
-    使用Walk-Forward方式：
-    - 训练集：历史N个月
-    - 验证集：接下来的1个月
-    - 测试集：再接下来的1个月
+    示例：
+        预测5日收益，需要5日Gap
+        Train: [月1-12] -> Gap: [12月末5天] -> Valid: [月13]
     """
 
-    def __init__(self, train_months=12, valid_months=1, test_months=1):
+    def __init__(self, train_months=12, valid_months=1, test_months=1,
+                 embargo_days=5):
+        """
+        Args:
+            embargo_days: 隔离期（天）- 应该 >= 预测周期
+        """
         self.train_months = train_months
         self.valid_months = valid_months
         self.test_months = test_months
+        self.embargo_days = embargo_days
 
     def split(self, data, date_column='date'):
-        """
-        时间序列切分
-
-        返回: [(train_idx, valid_idx, test_idx), ...]
-        """
+        """时间序列切分 + 数据隔离"""
         data = data.copy()
         data[date_column] = pd.to_datetime(data[date_column])
         data = data.sort_values(date_column)
 
-        # 按月分组
         data['year_month'] = data[date_column].dt.to_period('M')
         months = sorted(data['year_month'].unique())
 
         splits = []
 
-        # 滚动窗口
         for i in range(len(months) - self.train_months - self.valid_months - self.test_months + 1):
             train_end = i + self.train_months
             valid_end = train_end + self.valid_months
@@ -223,9 +80,20 @@ class TimeSeriesSplitter:
             valid_months_list = months[train_end:valid_end]
             test_months_list = months[valid_end:test_end]
 
+            # 初始索引
             train_idx = data[data['year_month'].isin(train_months_list)].index
             valid_idx = data[data['year_month'].isin(valid_months_list)].index
             test_idx = data[data['year_month'].isin(test_months_list)].index
+
+            # ✅ 关键优化：Purging + Embargo
+            if self.embargo_days > 0 and len(train_idx) > 0 and len(valid_idx) > 0:
+                # 获取训练集最后一天
+                train_last_date = data.loc[train_idx, date_column].max()
+
+                # 删除训练集中会与验证集重叠的样本
+                # 即删除训练集最后 embargo_days 天的数据
+                embargo_cutoff = train_last_date - pd.Timedelta(days=self.embargo_days)
+                train_idx = train_idx[data.loc[train_idx, date_column] <= embargo_cutoff]
 
             if len(train_idx) > 0 and len(valid_idx) > 0 and len(test_idx) > 0:
                 splits.append((train_idx, valid_idx, test_idx))
@@ -234,65 +102,366 @@ class TimeSeriesSplitter:
 
 
 # ============================================================================
-# 核心优化3: 高级ML评分器
+# 优化2: 特征正交化器 (Feature Orthogonalization)
 # ============================================================================
 
-class AdvancedMLScorer:
+class FeatureOrthogonalizer:
     """
-    高级机器学习评分器
+    特征正交化 - 提取纯Alpha
 
-    整合三大优化：
-    1. 时间序列切分（避免前视偏差）
-    2. 分类目标（预测TOP股票）
-    3. IC加权特征（因子有效性）
+    方法：
+    1. 市场中性化：残差 = 因子 - β_market × 市场收益
+    2. 行业中性化：残差 = 因子 - Σ(β_industry × 行业哑变量)
+    """
+
+    def __init__(self, neutralize_market=True, neutralize_industry=True):
+        self.neutralize_market = neutralize_market
+        self.neutralize_industry = neutralize_industry
+        self.market_models = {}  # {factor: LinearRegression}
+        self.industry_models = {}
+
+    def fit_transform(self, factor_data, factor_columns, price_data=None):
+        """
+        拟合并转换因子
+
+        Args:
+            factor_data: 因子数据（必须包含date, instrument）
+            factor_columns: 需要中性化的因子列表
+            price_data: 价格数据（用于计算市场收益）
+        """
+        print("\n🔧 特征正交化...")
+
+        factor_data = factor_data.copy()
+
+        # ===== 1. 市场中性化 =====
+        if self.neutralize_market and price_data is not None:
+            print("  ✓ 市场中性化...")
+            factor_data = self._neutralize_market(
+                factor_data, factor_columns, price_data
+            )
+
+        # ===== 2. 行业中性化 =====
+        if self.neutralize_industry and 'industry' in factor_data.columns:
+            print("  ✓ 行业中性化...")
+            factor_data = self._neutralize_industry(
+                factor_data, factor_columns
+            )
+
+        print("  ✓ 正交化完成")
+        return factor_data
+
+    def _neutralize_market(self, factor_data, factor_columns, price_data):
+        """市场中性化"""
+        # 计算市场收益（每日平均收益）
+        price_col = self._detect_price_column(price_data)
+        if price_col is None:
+            return factor_data
+
+        merged = factor_data.merge(
+            price_data[['instrument', 'date', price_col]],
+            on=['instrument', 'date'],
+            how='left'
+        )
+
+        # 每日市场收益
+        merged['daily_return'] = merged.groupby('instrument')[price_col].pct_change()
+        market_return = merged.groupby('date')['daily_return'].transform('mean')
+
+        # 对每个因子回归
+        for factor in factor_columns:
+            if factor not in merged.columns:
+                continue
+
+            # 过滤有效数据
+            valid = merged[[factor, 'daily_return']].dropna()
+            if len(valid) < 100:
+                continue
+
+            # 回归：factor = α + β × market_return + ε
+            X = valid['daily_return'].values.reshape(-1, 1)
+            y = valid[factor].values
+
+            model = LinearRegression()
+            model.fit(X, y)
+
+            # 残差 = 因子 - 预测值
+            merged.loc[valid.index, factor] = y - model.predict(X)
+
+            self.market_models[factor] = model
+
+        factor_data = merged.drop(columns=[price_col, 'daily_return'], errors='ignore')
+        return factor_data
+
+    def _neutralize_industry(self, factor_data, factor_columns):
+        """行业中性化"""
+        # 创建行业哑变量
+        industry_dummies = pd.get_dummies(
+            factor_data['industry'],
+            prefix='ind',
+            drop_first=True  # 避免完全共线性
+        )
+
+        for factor in factor_columns:
+            if factor not in factor_data.columns:
+                continue
+
+            # 过滤有效数据
+            valid_idx = factor_data[factor].notna()
+            if valid_idx.sum() < 100:
+                continue
+
+            X = industry_dummies.loc[valid_idx]
+            y = factor_data.loc[valid_idx, factor].values
+
+            # 回归：factor = Σ(β_i × industry_i) + ε
+            model = LinearRegression()
+            model.fit(X, y)
+
+            # 残差
+            factor_data.loc[valid_idx, factor] = y - model.predict(X)
+
+            self.industry_models[factor] = model
+
+        return factor_data
+
+    def _detect_price_column(self, df):
+        candidates = ['close', 'Close', 'CLOSE', 'price', 'Price']
+        for col in candidates:
+            if col in df.columns:
+                return col
+        return None
+
+
+# ============================================================================
+# 优化3: 集成投票器 (Ensemble Voting)
+# ============================================================================
+
+class EnsembleVotingScorer:
+    """
+    集成投票评分器
+
+    策略：
+    - 同时训练 XGBoost 和 LightGBM
+    - 预测时取概率均值
+    - 可选：只有两个模型都看多（概率>0.5）时才给高分
+    """
+
+    def __init__(self, voting_strategy='average', strict_threshold=0.6):
+        """
+        Args:
+            voting_strategy: 'average' | 'strict'
+                - average: 简单平均两个模型的预测
+                - strict: 只有两个模型都看多时才给高分
+            strict_threshold: strict模式下的阈值
+        """
+        self.voting_strategy = voting_strategy
+        self.strict_threshold = strict_threshold
+        self.xgb_model = None
+        self.lgb_model = None
+        self.scaler = StandardScaler()
+
+    def train(self, X_train, y_train, X_valid, y_valid, verbose=False):
+        """训练两个模型"""
+        print(f"\n🤝 集成训练 ({self.voting_strategy})...")
+
+        # 标准化
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_valid_scaled = self.scaler.transform(X_valid)
+
+        # ===== XGBoost =====
+        if XGBOOST_AVAILABLE:
+            print("  ✓ 训练 XGBoost...")
+            self.xgb_model = xgb.XGBClassifier(
+                objective='binary:logistic',
+                eval_metric='auc',
+                max_depth=5,  # 降低复杂度
+                learning_rate=0.03,
+                n_estimators=300,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                random_state=42,
+                n_jobs=-1
+            )
+
+            try:
+                self.xgb_model.fit(
+                    X_train_scaled, y_train,
+                    eval_set=[(X_valid_scaled, y_valid)],
+                    early_stopping_rounds=30,
+                    verbose=verbose
+                )
+            except:
+                self.xgb_model.fit(X_train_scaled, y_train)
+
+        # ===== LightGBM =====
+        if LIGHTGBM_AVAILABLE:
+            print("  ✓ 训练 LightGBM...")
+            self.lgb_model = lgb.LGBMClassifier(
+                objective='binary',
+                metric='auc',
+                max_depth=5,
+                learning_rate=0.03,
+                n_estimators=300,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1
+            )
+
+            try:
+                self.lgb_model.fit(
+                    X_train_scaled, y_train,
+                    eval_set=[(X_valid_scaled, y_valid)],
+                    callbacks=[lgb.early_stopping(30, verbose=verbose)]
+                )
+            except:
+                self.lgb_model.fit(X_train_scaled, y_train)
+
+        # 评估
+        y_pred = self.predict_proba(X_valid)
+        auc = roc_auc_score(y_valid, y_pred)
+        print(f"  ✓ 集成验证AUC: {auc:.4f}")
+
+        return self
+
+    def predict_proba(self, X):
+        """集成预测"""
+        X_scaled = self.scaler.transform(X)
+
+        predictions = []
+
+        if self.xgb_model is not None:
+            pred_xgb = self.xgb_model.predict_proba(X_scaled)[:, 1]
+            predictions.append(pred_xgb)
+
+        if self.lgb_model is not None:
+            pred_lgb = self.lgb_model.predict_proba(X_scaled)[:, 1]
+            predictions.append(pred_lgb)
+
+        if len(predictions) == 0:
+            raise ValueError("没有可用模型")
+
+        # ===== 投票策略 =====
+        if self.voting_strategy == 'average':
+            # 简单平均
+            return np.mean(predictions, axis=0)
+
+        elif self.voting_strategy == 'strict':
+            # 严格模式：两个都看多才给高分
+            avg_pred = np.mean(predictions, axis=0)
+
+            # 只有当两个模型都超过阈值时，才保留原始分数
+            if len(predictions) == 2:
+                both_bullish = (predictions[0] > self.strict_threshold) & \
+                               (predictions[1] > self.strict_threshold)
+                return np.where(both_bullish, avg_pred, avg_pred * 0.5)
+            else:
+                return avg_pred
+
+
+# ============================================================================
+# 优化4: Precision@K 评估器
+# ============================================================================
+
+class PrecisionAtKEvaluator:
+    """
+    Precision@K 评估器
+
+    关注指标：
+    - Precision@20%: Top 20% 中有多少是真正的赢家
+    - Recall@20%: 真正的赢家有多少被选中
+    """
+
+    @staticmethod
+    def precision_at_k(y_true, y_pred_proba, k=0.2):
+        """
+        计算 Precision@K
+
+        Args:
+            y_true: 真实标签
+            y_pred_proba: 预测概率
+            k: Top K比例
+
+        Returns:
+            precision, recall
+        """
+        n = len(y_true)
+        top_k = int(n * k)
+
+        # 选出Top K
+        top_k_idx = np.argsort(y_pred_proba)[-top_k:]
+
+        y_true_top = y_true[top_k_idx]
+
+        precision = y_true_top.sum() / len(y_true_top) if len(y_true_top) > 0 else 0
+        recall = y_true_top.sum() / y_true.sum() if y_true.sum() > 0 else 0
+
+        return precision, recall
+
+    @staticmethod
+    def evaluate_model(model, X_valid, y_valid, k=0.2):
+        """完整评估"""
+        y_pred_proba = model.predict_proba(X_valid)
+
+        auc = roc_auc_score(y_valid, y_pred_proba)
+        prec, rec = PrecisionAtKEvaluator.precision_at_k(y_valid, y_pred_proba, k)
+
+        print(f"    AUC: {auc:.4f}")
+        print(f"    Precision@{int(k*100)}%: {prec:.4f}")
+        print(f"    Recall@{int(k*100)}%: {rec:.4f}")
+
+        return {'auc': auc, 'precision': prec, 'recall': rec}
+
+
+# ============================================================================
+# 超级ML评分器 (整合四大优化)
+# ============================================================================
+
+class UltraMLScorer:
+    """
+    超级ML评分器
+
+    整合：
+    1. ✅ Purging & Embargo
+    2. ✅ Feature Orthogonalization
+    3. ✅ Ensemble Voting
+    4. ✅ Precision@K Focus
     """
 
     def __init__(self,
-                 model_type='xgboost',
                  target_period=5,
-                 top_percentile=0.20,  # 预测TOP 20%
-                 use_classification=True,
-                 use_ic_features=True,
+                 top_percentile=0.20,
+                 embargo_days=5,
+                 neutralize_market=True,
+                 neutralize_industry=True,
+                 voting_strategy='average',
                  train_months=12,
                  random_state=42):
-        """
-        :param model_type: 'xgboost' 或 'lightgbm'
-        :param target_period: 预测周期（天）
-        :param top_percentile: TOP股票比例
-        :param use_classification: 是否使用分类模型
-        :param use_ic_features: 是否使用IC作为特征
-        :param train_months: 训练窗口（月）
-        """
-        self.model_type = model_type
+
         self.target_period = target_period
         self.top_percentile = top_percentile
-        self.use_classification = use_classification
-        self.use_ic_features = use_ic_features
+        self.embargo_days = embargo_days
+        self.neutralize_market = neutralize_market
+        self.neutralize_industry = neutralize_industry
+        self.voting_strategy = voting_strategy
         self.train_months = train_months
         self.random_state = random_state
 
-        self.model = None
-        self.scaler = StandardScaler()
+        self.orthogonalizer = FeatureOrthogonalizer(
+            neutralize_market, neutralize_industry
+        )
+        self.ensemble = EnsembleVotingScorer(voting_strategy)
         self.feature_names = None
-        self.ic_calculator = ICCalculator([target_period])
-        self.ic_weights = {}
 
-        print(f"\n🚀 初始化高级ML评分器")
-        print(f"  模型类型: {model_type.upper()}")
-        print(f"  目标模式: {'分类' if use_classification else '回归'}")
-        print(f"  预测目标: {'TOP ' + str(int(top_percentile*100)) + '%' if use_classification else f'{target_period}日收益率'}")
-        print(f"  IC特征: {'启用' if use_ic_features else '关闭'}")
-        print(f"  训练窗口: {train_months}个月")
+        print(f"\n🚀 超级ML评分器")
+        print(f"  ✅ 数据隔离: {embargo_days}天Gap")
+        print(f"  ✅ 特征正交: 市场={neutralize_market}, 行业={neutralize_industry}")
+        print(f"  ✅ 集成投票: {voting_strategy}")
+        print(f"  ✅ 目标优化: Precision@{int(top_percentile*100)}%")
 
-    def prepare_training_data(self, factor_data, price_data, factor_columns):
-        """
-        准备训练数据
-
-        ✅ 优化1: 避免前视偏差
-        ✅ 优化2: 分类目标
-        ✅ 优化3: IC特征
-        ✅ 优化4: 使用超额收益 (Active Return) 作为目标
-        """
+    def prepare_data(self, factor_data, price_data, factor_columns):
+        """准备数据 + 特征正交化"""
         print(f"\n📦 准备训练数据...")
 
         # 检测价格列
@@ -300,478 +469,201 @@ class AdvancedMLScorer:
         if price_col is None:
             raise ValueError("未找到价格列")
 
-        # 合并数据
+        # 合并
         merged = factor_data.merge(
             price_data[['instrument', 'date', price_col]],
             on=['instrument', 'date'],
             how='left'
         )
-
         merged = merged.sort_values(['instrument', 'date'])
 
-        # ===== 优化1: 计算IC =====
-        if self.use_ic_features:
-            print("  ✓ 计算因子IC...")
-            ic_results = self.ic_calculator.calculate_factor_ic(
-                factor_data, price_data, factor_columns
-            )
-            self.ic_weights = self.ic_calculator.get_ic_weights(ic_results, self.target_period)
+        # ===== 特征正交化 =====
+        merged = self.orthogonalizer.fit_transform(
+            merged, factor_columns, price_data
+        )
 
-            # 添加IC作为特征
-            for factor in factor_columns:
-                if factor in ic_results:
-                    ic_value = ic_results[factor].get(self.target_period, {}).get('ic', 0)
-                    merged[f'{factor}_ic'] = ic_value
-
-        # ===== 优化2: 计算超额收益目标 =====
-        print(f"  ✓ 计算未来{self.target_period}日收益...")
-
-        # 1. 计算绝对收益
+        # ===== 计算超额收益目标 =====
         merged['abs_return'] = merged.groupby('instrument')[price_col].pct_change(
             self.target_period
         ).shift(-self.target_period)
 
-        # 2. 计算市场平均收益 (作为基准)
-        print(f"  ✨ 计算超额收益 (Active Return)...")
-        # 使用当日所有股票的收益均值作为市场基准
         market_return = merged.groupby('date')['abs_return'].transform('mean')
-
-        # 3. 计算超额收益 = 个股收益 - 市场均值
         merged['future_return'] = merged['abs_return'] - market_return
 
-        if self.use_classification:
-            # 分类目标：每天超额收益 TOP N% 的股票标记为1
-            print(f"  ✓ 转换为分类目标 (超额收益 TOP {self.top_percentile:.0%})...")
-            merged['target'] = 0
+        # 分类目标
+        merged['target'] = 0
+        for date in merged['date'].unique():
+            date_mask = merged['date'] == date
+            returns = merged.loc[date_mask, 'future_return']
+            if len(returns) > 5:
+                threshold = returns.quantile(1 - self.top_percentile)
+                merged.loc[date_mask & (merged['future_return'] >= threshold), 'target'] = 1
 
-            for date in merged['date'].unique():
-                date_mask = merged['date'] == date
-                returns = merged.loc[date_mask, 'future_return']
-                # 只有当有足够数据时才计算分位数
-                if len(returns) > 5:
-                    threshold = returns.quantile(1 - self.top_percentile)
-                    merged.loc[date_mask & (merged['future_return'] >= threshold), 'target'] = 1
+        # 过滤
+        merged = merged.dropna(subset=['target'])
 
-            target_col = 'target'
-        else:
-            target_col = 'future_return'
+        print(f"  ✓ 有效样本: {len(merged)}")
+        print(f"  ✓ 正样本比例: {merged['target'].mean():.2%}")
 
-        # 过滤有效数据
-        initial_len = len(merged)
-        merged = merged.dropna(subset=[target_col])
-        print(f"  ✓ 有效样本: {len(merged)} / {initial_len} ({len(merged)/initial_len*100:.1f}%)")
-
-        if self.use_classification:
-            pos_rate = merged['target'].mean()
-            print(f"  ✓ 正样本比例: {pos_rate:.2%}")
-
-        # ===== 构建特征 =====
-        # 排除非特征列，包括中间变量 abs_return
-        base_exclude = [
-            'date', 'instrument', 'future_return', 'abs_return', 'target', price_col,
-            'industry', 'ml_score', 'industry_rank', 'year_month', 'position'
+        # 构建特征
+        exclude = [
+            'date', 'instrument', 'future_return', 'abs_return',
+            'target', price_col, 'industry', 'year_month'
         ]
-
-        all_cols = merged.columns.tolist()
-        feature_cols = [col for col in all_cols if col not in base_exclude]
-
-        # 确保只使用数值型特征
-        feature_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(merged[c])]
-
-        # 处理只有position的情况
-        if len(feature_cols) == 0 and 'position' in merged.columns:
-            feature_cols = ['position']
-
-        print(f"  ✓ 特征数量: {len(feature_cols)}")
+        feature_cols = [c for c in merged.columns
+                       if c not in exclude and pd.api.types.is_numeric_dtype(merged[c])]
 
         X = merged[feature_cols].copy()
         X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
-        y = merged[target_col].values
+        y = merged['target'].values
 
         self.feature_names = feature_cols
 
         return X, y, merged
 
-    def train_walk_forward(self, X, y, merged, verbose=True):
-        """
-        ✅ Walk-Forward训练（避免前视偏差）
+    def train(self, X, y, merged, verbose=True):
+        """Walk-Forward训练 + Purging"""
+        print(f"\n🎯 Walk-Forward训练 (Purging={self.embargo_days}天)...")
 
-        使用滚动窗口：
-        - 每次用过去12个月训练
-        - 在下1个月验证
-        - 保存最佳模型
-        """
-        print(f"\n🎯 Walk-Forward训练...")
-
-        # 时间序列切分
-        splitter = TimeSeriesSplitter(
+        # 使用优化的切分器
+        splitter = PurgingEmbargoSplitter(
             train_months=self.train_months,
             valid_months=1,
-            test_months=1
+            test_months=1,
+            embargo_days=self.embargo_days
         )
 
         splits = splitter.split(merged, date_column='date')
 
         if len(splits) == 0:
-            print("  ⚠️  数据不足以进行时间序列切分，使用简单切分")
-            return self._train_simple(X, y, verbose)
+            print("  ⚠️  数据不足")
+            return self
 
-        print(f"  ✓ 生成了 {len(splits)} 个时间窗口")
+        print(f"  ✓ 生成 {len(splits)} 个窗口")
 
         best_model = None
         best_score = -np.inf
 
         for i, (train_idx, valid_idx, test_idx) in enumerate(splits):
-            if i >= 1:  # 只训练最后一个窗口（最新数据）
-                continue
-
             X_train = X.iloc[train_idx]
             y_train = y[train_idx]
             X_valid = X.iloc[valid_idx]
             y_valid = y[valid_idx]
 
-            print(f"\n  窗口 {i+1}/{len(splits)}:")
-            print(f"    训练: {len(X_train)} 样本")
-            print(f"    验证: {len(X_valid)} 样本")
+            print(f"\n  窗口 {i+1}/{len(splits)}")
 
-            # 标准化
-            X_train_scaled = self.scaler.fit_transform(X_train)
-            X_valid_scaled = self.scaler.transform(X_valid)
+            # 训练集成模型
+            ensemble = EnsembleVotingScorer(self.voting_strategy)
+            ensemble.train(X_train, y_train, X_valid, y_valid, verbose=False)
 
-            # 训练模型
-            if self.use_classification:
-                model = self._train_classifier(
-                    X_train_scaled, y_train,
-                    X_valid_scaled, y_valid,
-                    verbose=False
-                )
+            # ===== Precision@K 评估 =====
+            metrics = PrecisionAtKEvaluator.evaluate_model(
+                ensemble, X_valid, y_valid, self.top_percentile
+            )
 
-                # 评估
-                y_pred_proba = model.predict_proba(X_valid_scaled)[:, 1]
-                score = roc_auc_score(y_valid, y_pred_proba)
-                print(f"    验证AUC: {score:.4f}")
-            else:
-                model = self._train_regressor(
-                    X_train_scaled, y_train,
-                    X_valid_scaled, y_valid,
-                    verbose=False
-                )
-
-                # 评估
-                y_pred = model.predict(X_valid_scaled)
-                score = np.corrcoef(y_valid, y_pred)[0, 1]
-                print(f"    验证相关性: {score:.4f}")
+            # 使用 Precision@K 作为选择标准（而非AUC）
+            score = metrics['precision']
 
             if score > best_score:
                 best_score = score
-                best_model = model
+                best_model = ensemble
 
-        self.model = best_model
-        print(f"\n  ✓ 最佳模型验证得分: {best_score:.4f}")
-
-        return self
-
-    def _train_simple(self, X, y, verbose):
-        """简单训练（数据不足时使用）"""
-        from sklearn.model_selection import train_test_split
-
-        X_train, X_valid, y_train, y_valid = train_test_split(
-            X, y, test_size=0.2, random_state=self.random_state
-        )
-
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_valid_scaled = self.scaler.transform(X_valid)
-
-        if self.use_classification:
-            self.model = self._train_classifier(
-                X_train_scaled, y_train,
-                X_valid_scaled, y_valid,
-                verbose
-            )
-        else:
-            self.model = self._train_regressor(
-                X_train_scaled, y_train,
-                X_valid_scaled, y_valid,
-                verbose
-            )
+        self.ensemble = best_model
+        print(f"\n  ✓ 最佳模型 Precision@{int(self.top_percentile*100)}%: {best_score:.4f}")
 
         return self
 
-    def _train_classifier(self, X_train, y_train, X_valid, y_valid, verbose):
-        """训练分类器"""
-        if self.model_type == 'xgboost':
-            if not XGBOOST_AVAILABLE:
-                raise ImportError("XGBoost 未安装")
+    def predict(self, factor_data, price_data=None):
+        """预测评分"""
+        if price_data is not None:
+            # 重新训练
+            X, y, merged = self.prepare_data(
+                factor_data, price_data, self.feature_names
+            )
+            self.train(X, y, merged, verbose=False)
+            factor_data = merged.copy()
 
-            params = {
-                'objective': 'binary:logistic',
-                'eval_metric': 'auc',
-                'max_depth': 6,
-                'learning_rate': 0.05,
-                'n_estimators': 200,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'random_state': self.random_state,
-                'n_jobs': -1
-            }
+        print(f"\n🎯 预测评分...")
 
-            model = xgb.XGBClassifier(**params)
+        valid_features = [c for c in self.feature_names if c in factor_data.columns]
+        X = factor_data[valid_features].copy()
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
 
-            try:
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_valid, y_valid)],
-                    early_stopping_rounds=20,
-                    verbose=verbose
-                )
-            except:
-                model.fit(X_train, y_train)
+        predicted_proba = self.ensemble.predict_proba(X)
+        factor_data['ml_score'] = predicted_proba
+        factor_data['position'] = factor_data.groupby('date')['ml_score'].rank(pct=True)
 
-            return model
+        print(f"  ✓ 预测完成")
+        print(f"  ✓ Top 20% 平均分: {factor_data[factor_data['position']>=0.8]['ml_score'].mean():.4f}")
 
-        elif self.model_type == 'lightgbm':
-            if not LIGHTGBM_AVAILABLE:
-                raise ImportError("LightGBM 未安装")
-
-            params = {
-                'objective': 'binary',
-                'metric': 'auc',
-                'max_depth': 6,
-                'learning_rate': 0.05,
-                'n_estimators': 200,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'random_state': self.random_state,
-                'n_jobs': -1,
-                'verbose': -1
-            }
-
-            model = lgb.LGBMClassifier(**params)
-
-            try:
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_valid, y_valid)],
-                    callbacks=[lgb.early_stopping(20, verbose=verbose)]
-                )
-            except:
-                model.fit(X_train, y_train)
-
-            return model
-
-    def _train_regressor(self, X_train, y_train, X_valid, y_valid, verbose):
-        """训练回归器"""
-        if self.model_type == 'xgboost':
-            if not XGBOOST_AVAILABLE:
-                raise ImportError("XGBoost 未安装")
-
-            params = {
-                'objective': 'reg:squarederror',
-                'max_depth': 6,
-                'learning_rate': 0.05,
-                'n_estimators': 200,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'random_state': self.random_state,
-                'n_jobs': -1
-            }
-
-            model = xgb.XGBRegressor(**params)
-
-            try:
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_valid, y_valid)],
-                    early_stopping_rounds=20,
-                    verbose=verbose
-                )
-            except:
-                model.fit(X_train, y_train)
-
-            return model
+        return factor_data
 
     def _detect_price_column(self, df):
-        """检测价格列"""
         candidates = ['close', 'Close', 'CLOSE', 'price', 'Price']
         for col in candidates:
             if col in df.columns:
                 return col
         return None
 
-    def predict_scores(self, factor_data, price_data=None, factor_columns=None):
-        """预测评分"""
-        if price_data is not None:
-            # 在预测阶段也使用超额收益作为目标进行训练
-            X, y, merged = self.prepare_training_data(factor_data, price_data, factor_columns)
-            self.train_walk_forward(X, y, merged, verbose=False)
-            factor_data = merged.copy()
-
-        if self.model is None:
-            raise ValueError("模型未训练")
-
-        print(f"\n🎯 预测股票评分 (基于超额收益模型)...")
-
-        # 确保只使用训练时用到的特征
-        valid_features = [c for c in self.feature_names if c in factor_data.columns]
-        X = factor_data[valid_features].copy()
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
-
-        X_scaled = self.scaler.transform(X)
-
-        if self.use_classification:
-            # 预测概率
-            predicted_proba = self.model.predict_proba(X_scaled)[:, 1]
-            factor_data['ml_score'] = predicted_proba
-        else:
-            # 预测收益率
-            predicted_returns = self.model.predict(X_scaled)
-            factor_data['ml_score'] = predicted_returns
-
-        # 标准化到0-1
-        factor_data['position'] = factor_data.groupby('date')['ml_score'].rank(pct=True)
-
-        print(f"  ✓ 预测完成")
-        print(f"  ✓ 平均评分: {factor_data['ml_score'].mean():.4f}")
-        print(f"  ✓ 评分标准差: {factor_data['ml_score'].std():.4f}")
-
-        return factor_data
-
 
 # ============================================================================
-# 行业数据获取（修复版 - 使用 Tushare stock_basic）
+# 使用示例
 # ============================================================================
 
-def get_industry_data(instruments, tushare_token=None):
-    """
-    获取行业数据 - 使用 Tushare stock_basic（最简单最快）
+def demo_ultra_scorer():
+    """演示超级评分器"""
+    print("="*80)
+    print("超级ML评分器 - 四大优化演示")
+    print("="*80)
 
-    Args:
-        instruments: 股票代码列表
-        tushare_token: Tushare token
+    # 生成模拟数据
+    np.random.seed(42)
+    dates = pd.date_range('2023-01-01', periods=400, freq='D')
+    instruments = [f'STOCK_{i:03d}' for i in range(100)]
 
-    Returns:
-        DataFrame: [instrument, industry]
-    """
-    if tushare_token is None:
-        print("  ⚠️  未提供 Tushare Token")
-        return pd.DataFrame({
-            'instrument': instruments,
-            'industry': 'Unknown'
-        })
-
-    try:
-        import tushare as ts
-        ts.set_token(tushare_token)
-        pro = ts.pro_api()
-
-        print(f"  📊 获取 {len(instruments)} 只股票的行业数据...")
-
-        # ✅ 使用 stock_basic 获取申万行业（一次调用获取所有）
-        stock_basic = pro.stock_basic(
-            exchange='',
-            list_status='L',
-            fields='ts_code,name,industry'  # industry是申万一级行业
-        )
-
-        # 过滤目标股票
-        stock_basic = stock_basic[stock_basic['ts_code'].isin(instruments)]
-        stock_basic['instrument'] = stock_basic['ts_code']
-        stock_basic['industry'] = stock_basic['industry'].fillna('其他')
-
-        result = stock_basic[['instrument', 'industry']]
-
-        # 补充未匹配的股票
-        missing = set(instruments) - set(result['instrument'])
-        if missing:
-            print(f"  ⚠️  {len(missing)} 只股票未找到行业，标记为'其他'")
-            missing_df = pd.DataFrame({
-                'instrument': list(missing),
-                'industry': '其他'
+    data = []
+    for date in dates:
+        for inst in instruments:
+            data.append({
+                'date': date,
+                'instrument': inst,
+                'close': 100 + np.random.randn() * 10,
+                'factor1': np.random.randn(),
+                'factor2': np.random.randn(),
+                'factor3': np.random.randn(),
+                'industry': np.random.choice(['科技', '金融', '消费', '医药'])
             })
-            result = pd.concat([result, missing_df], ignore_index=True)
 
-        print(f"  ✓ 获取到 {len(result)} 只股票的行业信息")
-        print(f"  ✓ 覆盖率: {(len(result) - len(missing))/len(instruments)*100:.1f}%")
-        print(f"  ✓ 行业分类: {result['industry'].nunique()} 个")
+    df = pd.DataFrame(data)
 
-        # 显示TOP5行业
-        top_industries = result['industry'].value_counts().head(5)
-        print(f"\n  📊 TOP5行业:")
-        for industry, count in top_industries.items():
-            print(f"     {industry}: {count}只")
+    factor_cols = ['factor1', 'factor2', 'factor3']
 
-        return result
+    # 初始化超级评分器
+    scorer = UltraMLScorer(
+        target_period=5,
+        top_percentile=0.20,
+        embargo_days=5,
+        neutralize_market=True,
+        neutralize_industry=True,
+        voting_strategy='average',
+        train_months=6
+    )
 
-    except Exception as e:
-        print(f"  ⚠️  获取行业数据失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return pd.DataFrame({
-            'instrument': instruments,
-            'industry': 'Unknown'
-        })
+    # 准备数据
+    X, y, merged = scorer.prepare_data(
+        df, df, factor_cols
+    )
 
+    # 训练
+    scorer.train(X, y, merged)
 
-class IndustryBasedScorer:
-    """分行业评分器"""
+    # 预测
+    result = scorer.predict(df.tail(500), df)
 
-    def __init__(self, tushare_token=None):
-        self.tushare_token = tushare_token
-
-    def score_by_industry(self, factor_data, factor_columns=None):
-        """分行业评分"""
-        print("\n🏢 分行业评分...")
-
-        instruments = factor_data['instrument'].unique()
-        industry_data = get_industry_data(instruments, self.tushare_token)
-
-        if 'industry' in factor_data.columns:
-            factor_data = factor_data.drop(columns=['industry'])
-
-        factor_data = factor_data.merge(industry_data, on='instrument', how='left')
-        factor_data['industry'] = factor_data['industry'].fillna('Unknown')
-
-        try:
-            factor_data['industry_rank'] = factor_data.groupby(['date', 'industry'])['position'].rank(pct=True)
-            print(f"  ✓ 行业评分完成")
-
-            # 统计行业分布
-            industry_dist = factor_data.groupby('industry')['instrument'].nunique()
-            print(f"\n  📊 行业分布 (股票数):")
-            for industry, count in industry_dist.head(10).items():
-                print(f"     {industry}: {count}只")
-
-        except Exception as e:
-            print(f"  ⚠️  行业评分失败: {e}")
-            factor_data['industry_rank'] = factor_data['position']
-
-        return factor_data
+    print("\n" + "="*80)
+    print("✅ 演示完成！")
+    print("="*80)
 
 
-class EnhancedStockSelector:
-    """增强选股器"""
-
-    def select_stocks(self, factor_data, min_score=0.6, max_concentration=0.15, max_industry_concentration=0.3):
-        """选股"""
-        print(f"\n🎯 增强选股 (阈值: {min_score})...")
-
-        filtered = factor_data[factor_data['position'] >= min_score].copy()
-        print(f"  ✓ 评分过滤: {len(filtered)} / {len(factor_data)} 只股票")
-
-        if 'industry' not in filtered.columns:
-            filtered['industry'] = 'Unknown'
-
-        filtered['industry'] = filtered['industry'].fillna('Unknown')
-
-        return filtered
-
-
-# 导出
-__all__ = [
-    'AdvancedMLScorer',
-    'ICCalculator',
-    'TimeSeriesSplitter',
-    'IndustryBasedScorer',
-    'EnhancedStockSelector',
-    'get_industry_data'
-]
+if __name__ == '__main__':
+    demo_ultra_scorer()

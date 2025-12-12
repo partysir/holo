@@ -33,6 +33,9 @@ class StrategyConfig:
     # 调试模式
     DEBUG_MODE = False  # 是否显示详细交易日志
 
+    # 大盘择时
+    ENABLE_MARKET_TIMING = False  # 是否启用大盘择时
+
 
 # ========== 回测参数 ==========
 class BacktestConfig:
@@ -46,7 +49,7 @@ class BacktestConfig:
     CAPITAL_BASE = 1000000  # 初始资金
 
     # 持仓配置
-    POSITION_SIZE = 5  # 持仓数量
+    POSITION_SIZE = 10  # 持仓数量
     REBALANCE_DAYS = 5  # 调仓周期（天）
     POSITION_METHOD = 'equal'  # 仓位分配方法（v1.0使用）
 
@@ -113,7 +116,7 @@ class DataConfig:
 
     # 性能优化
     MAX_WORKERS = 10  # 并行线程数
-    FORCE_FULL_UPDATE = True  # 是否强制全量更新
+    FORCE_FULL_UPDATE = False  # 是否强制全量更新
 
 
 # ========== 因子配置 ==========
@@ -123,6 +126,7 @@ class FactorConfig:
     # 模型选择
     USE_STOCKRANKER = True  # 使用StockRanker模型
     USE_FUNDAMENTAL = True  # 使用基本面因子
+    USE_MONEY_FLOW = True  # ✅ 新增：启用资金流因子
 
     # 自定义权重（None=使用默认）
     CUSTOM_WEIGHTS = None
@@ -130,6 +134,17 @@ class FactorConfig:
     # IC调整
     ENABLE_IC_ADJUSTMENT = True  # 启用IC动态调权
     IC_ADJUSTMENT_DECAY = 0.7  # IC调权衰减系数
+
+    # ✅ 新增：资金流因子配置
+    MONEY_FLOW_CONFIG = {
+        'use_full_tick': False,           # 是否使用完整tick数据
+        'weight_main_netflow': 0.10,      # 主力净流入权重
+        'weight_main_strength': 0.08,     # 主力强度权重
+        'weight_large_netflow': 0.07,     # 超大单净流入权重
+        'main_continuous_inflow': 0.05,      # 主力持续流入
+        'main_vs_retail_ratio': 0.05,        # 主力散户对比
+        'main_activity': 0.05,               # 主力活跃度       
+    }
 
 
 # ========== 高级ML配置 ==========
@@ -152,6 +167,20 @@ class MLConfig:
     # 选股参数
     ML_MIN_SCORE = 0.6  # 最低评分阈值
 
+    """机器学习配置"""
+    USE_ADVANCED_ML = True
+    ML_MODEL_TYPE = 'xgboost'  # 'xgboost' 或 'lightgbm'
+    ML_TARGET_PERIOD = 5
+    ML_TOP_PERCENTILE = 0.20
+    ML_USE_CLASSIFICATION = True
+    ML_USE_IC_FEATURES = True
+    ML_TRAIN_MONTHS = 12
+    
+    # ========== 新增配置 ==========
+    ML_MODEL_DIR = './models'        # 模型保存目录
+    ML_AUTO_SAVE = True              # 是否自动保存模型
+    ML_PREDICT_ONLY = True          # 是否仅预测模式
+    ML_FORCE_RETRAIN = False         # 是否强制重新训练
 
 # ========== 遗传算法配置 ==========
 class GeneticConfig:
@@ -224,6 +253,8 @@ def print_all_configs():
     for k, v in get_config(StrategyConfig).items():
         if k == 'CASH_RESERVE_RATIO':
             print(f"  {k}: {v:.1%} (目标资金利用率: {1-v:.1%})")
+        elif k == 'ENABLE_MARKET_TIMING':
+            print(f"  {k}: {'启用' if v else '禁用'}")
         else:
             print(f"  {k}: {v}")
 
@@ -312,6 +343,9 @@ def get_strategy_params():
 
         # v2.0 新增
         'cash_reserve_ratio': StrategyConfig.CASH_RESERVE_RATIO,
+        
+        # 大盘择时
+        'enable_market_timing': StrategyConfig.ENABLE_MARKET_TIMING,
 
         # 风控参数
         'enable_score_decay_stop': RiskControlConfig.ENABLE_SCORE_DECAY_STOP,

@@ -179,12 +179,15 @@ class EnhancedStrategy:
 
         if action == 'buy':
             # ========== 关键修复：使用可用现金 ==========
+            target_value = 0  # 初始化变量
             if weight is not None:
                 # ✅ 修复：正确计算可买入金额
                 target_value = self.cash * weight
                 # 修复买入金额计算逻辑
                 available_value = target_value / (1 + self.buy_cost)
-                shares = int(available_value / price)
+                shares = int(available_value / price) if available_value is not None else 0
+            else:
+                shares = 0
 
             if self.debug:
                 print(f"  [BUY] {date_str} {stock}:")
@@ -193,7 +196,7 @@ class EnhancedStrategy:
                 print(f"    计算股数: {shares:,.0f}股")
 
             # ✨ A股整百股限制
-            shares = int(shares / 100) * 100
+            shares = int(shares / 100) * 100 if shares is not None else 0
 
             if shares < 100:  # ✨ 至少100股
                 if self.debug:
@@ -486,6 +489,7 @@ def run_enhanced_strategy(factor_data, price_data, start_date, end_date,
                          buy_cost=0.0003, sell_cost=0.0003, tax_ratio=0.0005,
                          stop_loss=-0.15, score_threshold=0.15,
                          score_decay_rate=1.0, force_replace_days=45,
+                         cash_reserve_ratio=0.0,  # 添加现金储备比例参数
                          silent=False, debug=False):
     """运行增强版策略"""
     engine = EnhancedStrategy(
@@ -496,5 +500,12 @@ def run_enhanced_strategy(factor_data, price_data, start_date, end_date,
         stop_loss, score_threshold, score_decay_rate, force_replace_days,
         debug
     )
+    
+    # 如果提供了现金储备比例，则相应调整初始资金
+    if cash_reserve_ratio > 0:
+        adjusted_capital = int(capital_base * (1 - cash_reserve_ratio))
+        engine.capital_base = adjusted_capital
+        engine.cash = float(adjusted_capital)
+        print(f"  💰 现金储备比例: {cash_reserve_ratio:.1%} (实际投资资金: ¥{adjusted_capital:,.0f})")
 
     return engine.run(silent=silent)

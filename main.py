@@ -198,7 +198,8 @@ def main():
             force_full_update=FORCE_FULL_UPDATE,
             use_sampling=USE_SAMPLING,      # ✨启用智能抽样
             sample_size=SAMPLE_SIZE,        # ✨抽样数量
-            max_workers=MAX_WORKERS         # ✨线程数
+            max_workers=MAX_WORKERS,         # ✨线程数
+            use_money_flow=True             # ✅ 启用资金流因子
         )
 
         data_elapsed = time.time() - data_start_time
@@ -501,7 +502,7 @@ def main():
             # 1. 生成每日持仓监控报告
             from holdings_monitor import generate_daily_holdings_report
             
-            daily_holdings = generate_daily_holdings_report(
+            daily_holdings, pnl_info = generate_daily_holdings_report(
                 context=context,
                 factor_data=factor_data,
                 price_data=price_data,
@@ -510,6 +511,10 @@ def main():
                 save_to_csv=True         # 保存CSV
             )
             
+            # 保存总盈亏信息到context中，供后续使用
+            if pnl_info:
+                context['pnl_info'] = pnl_info
+                
         except Exception as e:
             print(f"\n⚠️  每日持仓报告生成警告: {e}")
             import traceback
@@ -525,6 +530,10 @@ def main():
                 price_data=price_data,
                 output_dir=date_folder  # 使用日期文件夹
             )
+            
+            # 获取并显示绩效报告信息（包含年化收益率等指标）
+            from visualization_module import generate_performance_report
+            performance_info = generate_performance_report(context, output_dir=date_folder)
             
         except Exception as e:
             print(f"\n⚠️  今日持仓仪表板生成警告: {e}")
@@ -589,10 +598,32 @@ def main():
     print(f"    - 行业中性化: 已启用")
     print(f"    - 分行业评分: 已启用")
 
-    print("\n📊 回测结果:")
+    print(f"\n📊 回测结果:")
     print(f"  最终资产: ¥{context['final_value']:,.0f}")
     print(f"  总收益率: {context['total_return']:+.2%}")
     print(f"  胜率: {context['win_rate']:.2%}")
+    
+    # 显示总盈亏信息（如果可用）
+    if 'pnl_info' in context:
+        pnl_info = context['pnl_info']
+        print(f"\n💰 交易绩效摘要:")
+        print(f"  总盈利 (正盈亏部分): ¥{pnl_info['total_profit']:,.2f}")
+        print(f"  总亏损 (负盈亏部分): ¥{pnl_info['total_loss']:,.2f}")
+        print(f"  净盈亏 (总盈利 + 总亏损): ¥{pnl_info['net_pnl']:,.2f}")
+        print(f"  交易费用总和: ¥{pnl_info['total_fees']:,.2f}")
+        print(f"  扣除费用后净盈亏: ¥{pnl_info['net_pnl_after_fees']:,.2f}")
+        if context['initial_capital'] > 0:
+            net_return = pnl_info['net_pnl_after_fees'] / context['initial_capital']
+            print(f"  净收益率: {net_return:+.2%}")
+    
+    # 显示年化收益率等绩效指标（如果可用）
+    if 'performance_info' in context:
+        perf_info = context['performance_info']
+        print(f"\n📈 绩效指标:")
+        print(f"  总收益率: {perf_info['total_return']:+.2%}")
+        print(f"  年化收益率: {perf_info['annualized_return']:+.2%}")
+        print(f"  最大回撤: {perf_info['max_drawdown']:.2%}")
+        print(f"  夏普比率: {perf_info['sharpe_ratio']:.4f}")
 
     print("\n⚡ 速度优化效果:")
     print(f"  数据加载: {data_elapsed:.1f}秒")

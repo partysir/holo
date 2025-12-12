@@ -135,6 +135,7 @@ class FactorBasedRiskControlOptimized:
                  # ✨ 新增：基准数据（用于择时）
                  benchmark_data=None,
                  market_ma_period=60, # 60日均线择时
+                 enable_market_timing=True,  # ✨ 新增：是否启用择时
 
                  start_date='2023-01-01', end_date='2025-12-05',
                  capital_base=1000000, position_size=10,
@@ -171,6 +172,7 @@ class FactorBasedRiskControlOptimized:
         self.price_data = price_data
         self.benchmark_data = benchmark_data # 指数数据
         self.market_ma_period = market_ma_period
+        self.enable_market_timing = enable_market_timing  # ✨ 新增：保存择时开关
 
         self.start_date = start_date
         self.end_date = end_date
@@ -212,8 +214,8 @@ class FactorBasedRiskControlOptimized:
         self.factor_dict = self._build_factor_dict()
         self.trading_days = sorted(factor_data['date'].unique())
 
-        # 预计算大盘均线
-        self.market_signals = self._calculate_market_signals()
+        # 预计算大盘均线（如果启用了择时）
+        self.market_signals = self._calculate_market_signals() if self.enable_market_timing else {}
 
         # 行业信息
         if 'industry' in factor_data.columns:
@@ -236,8 +238,10 @@ class FactorBasedRiskControlOptimized:
         print(f"  ✓ 系统初始化完成")
         print(f"\n  【v2.2 完整集成版配置】")
         print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        if self.benchmark_data is not None:
+        if self.benchmark_data is not None and self.enable_market_timing:
             print(f"  📈 择时模块: 已启用 ({market_ma_period}日均线)")
+        elif self.benchmark_data is not None and not self.enable_market_timing:
+            print(f"  ⏸️  择时模块: 已禁用 (基准数据可用但未启用)")
         else:
             print(f"  ⚠️  择时模块: 未启用 (无基准数据)")
         print(f"  💰 最佳现金管理:")
@@ -771,11 +775,13 @@ def run_factor_based_strategy_v2(factor_data, price_data,
                                  start_date='2023-01-01', end_date='2025-12-05',
                                  capital_base=1000000, position_size=10,
                                  rebalance_days=5, cash_reserve_ratio=0.05,
+                                 enable_market_timing=True,  # ✨ 新增：择时开关
                                  **kwargs):
     """运行因子风控 + 最佳现金管理策略（v2.1 含择时）"""
     engine = FactorBasedRiskControlOptimized(
         factor_data, price_data,
         benchmark_data=benchmark_data, # 传入基准数据
+        enable_market_timing=enable_market_timing,  # ✨ 新增：传递择时开关
         start_date=start_date, end_date=end_date, capital_base=capital_base,
         position_size=position_size, rebalance_days=rebalance_days,
         cash_reserve_ratio=cash_reserve_ratio, **kwargs
