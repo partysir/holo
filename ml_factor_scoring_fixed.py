@@ -71,6 +71,11 @@ class PurgingEmbargoSplitter:
 
         splits = []
 
+        # 检查是否有足够的月份
+        required_months = self.train_months + self.valid_months + self.test_months
+        if len(months) < required_months:
+            return splits
+
         for i in range(len(months) - self.train_months - self.valid_months - self.test_months + 1):
             train_end = i + self.train_months
             valid_end = train_end + self.valid_months
@@ -157,23 +162,40 @@ class FeatureOrthogonalizer:
         if price_col is None:
             return factor_data
 
-        merged = factor_data.merge(
-            price_data[['instrument', 'date', price_col]],
-            on=['instrument', 'date'],
-            how='left'
-        )
+        # 检查 price_col 是否在 price_data 中存在
+        if price_col not in price_data.columns:
+            return factor_data
+            
+        # 检查所需的列是否存在
+        required_cols = ['instrument', 'date', price_col]
+        missing_cols = [col for col in required_cols if col not in price_data.columns]
+        if missing_cols:
+            return factor_data
+
+        # 检查 price_col 是否已经在 factor_data 中（已合并的情况）
+        if price_col not in factor_data.columns:
+            # 如果不在，则进行合并
+            factor_data = factor_data.merge(
+                price_data[['instrument', 'date', price_col]],
+                on=['instrument', 'date'],
+                how='left'
+            )
+        
+        # 检查合并后的数据
+        if price_col not in factor_data.columns:
+            return factor_data
 
         # 每日市场收益
-        merged['daily_return'] = merged.groupby('instrument')[price_col].pct_change()
-        market_return = merged.groupby('date')['daily_return'].transform('mean')
+        factor_data['daily_return'] = factor_data.groupby('instrument')[price_col].pct_change()
+        market_return = factor_data.groupby('date')['daily_return'].transform('mean')
 
         # 对每个因子回归
         for factor in factor_columns:
-            if factor not in merged.columns:
+            if factor not in factor_data.columns:
                 continue
 
             # 过滤有效数据
-            valid = merged[[factor, 'daily_return']].dropna()
+            valid = factor_data[[factor, 'daily_return']].dropna()
             if len(valid) < 100:
                 continue
 
@@ -185,11 +207,12 @@ class FeatureOrthogonalizer:
             model.fit(X, y)
 
             # 残差 = 因子 - 预测值
-            merged.loc[valid.index, factor] = y - model.predict(X)
+            factor_data.loc[valid.index, factor] = y - model.predict(X)
 
             self.market_models[factor] = model
 
-        factor_data = merged.drop(columns=[price_col, 'daily_return'], errors='ignore')
+        # 删除临时列
+        factor_data = factor_data.drop(columns=['daily_return'], errors='ignore')
         return factor_data
 
     def _neutralize_industry(self, factor_data, factor_columns):
@@ -229,6 +252,10 @@ class FeatureOrthogonalizer:
         for col in candidates:
             if col in df.columns:
                 return col
+        # 如果没找到，返回第一个可用的数值列作为价格列
+        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col]) and col not in ['volume', 'amount']]
+        if numeric_cols:
+            return numeric_cols[0]
         return None
 
 
@@ -577,8 +604,12 @@ class UltraMLScorer:
         """预测评分"""
         if price_data is not None:
             # 重新训练
+            # 检测因子列
+            exclude_cols = ['date', 'instrument', 'industry']
+            factor_columns = [col for col in factor_data.columns if col not in exclude_cols and pd.api.types.is_numeric_dtype(factor_data[col])]
+            
             X, y, merged = self.prepare_data(
-                factor_data, price_data, self.feature_names
+                factor_data, price_data, factor_columns
             )
             self.train(X, y, merged, verbose=False)
             factor_data = merged.copy()

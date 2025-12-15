@@ -31,7 +31,7 @@ class StrategyConfig:
     """
 
     # 调试模式
-    DEBUG_MODE = False  # 是否显示详细交易日志
+    DEBUG_MODE = True  # 是否显示详细交易日志
 
     # 大盘择时
     ENABLE_MARKET_TIMING = False  # 是否启用大盘择时
@@ -46,11 +46,11 @@ class BacktestConfig:
     END_DATE = datetime.now().strftime('%Y-%m-%d')
 
     # 资金配置
-    CAPITAL_BASE = 1000000  # 初始资金
+    CAPITAL_BASE = 1000000  # 初始资金（从10万修正为100万）
 
     # 持仓配置
-    POSITION_SIZE = 10  # 持仓数量
-    REBALANCE_DAYS = 5  # 调仓周期（天）
+    POSITION_SIZE: int = 5  # 持仓数量
+    REBALANCE_DAYS: int = 5  # 调仓周期（天）
     POSITION_METHOD = 'equal'  # 仓位分配方法（v1.0使用）
 
     # 风险控制（通用）
@@ -70,12 +70,12 @@ class RiskControlConfig:
 
     # 1. 因子衰减止损
     ENABLE_SCORE_DECAY_STOP = True  # 启用因子衰减止损
-    SCORE_DECAY_THRESHOLD = 0.30  # 评分下降30%止损
+    SCORE_DECAY_THRESHOLD = 0.20  # 评分下降20%止损  # 从0.30收紧到0.20
     MIN_HOLDING_DAYS = 5  # 最少持有5天
 
     # 2. 相对排名止损
     ENABLE_RANK_STOP = True  # 启用相对排名止损
-    RANK_PERCENTILE_THRESHOLD = 0.80  # 跌出前70%止损
+    RANK_PERCENTILE_THRESHOLD = 0.85  # 跌出前85%止损  # 从0.80提高到0.85
 
     # 3. 组合回撤保护
     MAX_PORTFOLIO_DRAWDOWN = -0.15  # 组合回撤-15%降仓
@@ -157,7 +157,7 @@ class MLConfig:
     # 模型参数
     ML_MODEL_TYPE = 'xgboost'  # 模型类型：'xgboost', 'lightgbm', 'random_forest'
     ML_TARGET_PERIOD = 5  # 预测周期（天）
-    ML_TOP_PERCENTILE = 0.20  # 预测TOP 20%
+    ML_TOP_PERCENTILE = 0.10  # 预测TOP 10%  # 从0.20改为0.10
 
     # 训练参数
     ML_USE_CLASSIFICATION = True  # 使用分类模型（预测TOP股票）
@@ -167,15 +167,6 @@ class MLConfig:
     # 选股参数
     ML_MIN_SCORE = 0.6  # 最低评分阈值
 
-    """机器学习配置"""
-    USE_ADVANCED_ML = True
-    ML_MODEL_TYPE = 'xgboost'  # 'xgboost' 或 'lightgbm'
-    ML_TARGET_PERIOD = 5
-    ML_TOP_PERCENTILE = 0.20
-    ML_USE_CLASSIFICATION = True
-    ML_USE_IC_FEATURES = True
-    ML_TRAIN_MONTHS = 12
-    
     # ========== 新增配置 ==========
     ML_MODEL_DIR = './models'        # 模型保存目录
     ML_AUTO_SAVE = True              # 是否自动保存模型
@@ -237,10 +228,7 @@ class NotificationConfig:
 # ========== 便捷函数 ==========
 def get_config(config_class):
     """获取配置字典"""
-    return {
-        k: v for k, v in config_class.__dict__.items()
-        if not k.startswith('_')
-    }
+    return {k: v for k, v in config_class.__dict__.items() if not k.startswith('_')}
 
 
 def print_all_configs():

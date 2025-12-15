@@ -47,6 +47,8 @@ def generate_performance_report(context, output_dir='./reports'):
             initial_capital = first_record['portfolio_value']
     
     final_value = daily_records['portfolio_value'].iloc[-1]
+    
+    # ✅ 修复：正确计算总收益率（基于初始资金而非第一天的组合价值）
     total_return = (final_value - initial_capital) / initial_capital
 
     # ✨ 修复：年化收益率计算（按照年化收益率计算规范）
@@ -218,21 +220,21 @@ def generate_performance_report(context, output_dir='./reports'):
                           pd.to_datetime(info['entry_date'])).days
             print(f"    {stock}: {info['shares']} 股 @ ¥{info['cost']:.2f} "
                   f"(买入: {info['entry_date']}, 持有{holding_days}天)")
-
-    print()
     
+    # 返回绩效信息供其他函数使用
     return {
-        'initial_capital': initial_capital,
-        'final_value': final_value,
         'total_return': total_return,
         'annualized_return': annualized_return,
         'max_drawdown': max_drawdown,
         'sharpe_ratio': sharpe_ratio,
-        'win_rate': win_rate,
+        'volatility': annualized_volatility,
+        'initial_capital': initial_capital,
+        'final_value': final_value,
         'total_profit': total_profit,
         'total_loss': total_loss,
         'net_pnl': net_pnl,
         'total_fees': total_fees,
+        'net_pnl_after_fees': net_pnl - total_fees,
         'net_return': (net_pnl - total_fees) / initial_capital if initial_capital > 0 else 0
     }
 

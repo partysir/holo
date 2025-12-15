@@ -300,6 +300,7 @@ class EnhancedStrategy:
         调仓（修复版）
 
         ✅ 确保先卖出再买入，避免资金不足
+        ✅ 新增：绝对分值过滤，提高确定性
         """
         date_str = str(date)
         scores = self.factor_dict.get(date_str, {})
@@ -308,38 +309,40 @@ class EnhancedStrategy:
         if self.debug:
             print(f"\n{'='*60}")
             print(f"[调仓] {date_str}")
-            print(f"  当前持仓: {len(self.positions)}只")
-            print(f"  可用现金: ¥{self.cash:,.0f}")
-            print(f"  组合价值: ¥{self.portfolio_value:,.0f}")
-            print(f"{'='*60}")
 
-        # 1. 止损
+        # 1. 止损检查
         stop_loss_stocks = self.check_stop_loss(date)
         for stock in stop_loss_stocks:
-            if self.debug:
-                print(f"  ⚠️  止损: {stock}")
             self.execute_trade(date, stock, 'sell', reason='stop_loss')
 
-        # 2. 更新持仓评分
-        self.update_position_scores(date)
-
-        # 3. 获取候选股票
+        # 2. 获取候选股票
         if not scores:
             return
 
         sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        top_candidates = sorted_candidates[:50]
+        
+        # ✅ 新增：绝对分值过滤
+        # 如果排第一的股票评分都很低(例如<0.6)，说明由于 strict 模式所有模型都不看好
+        # 这时候宁愿空仓
+        valid_candidates = [c for c in sorted_candidates if c[1] > 0.6] 
+        
+        # 如果符合条件的太少，就取前几名，但这样能过滤掉垃圾时间
+        if not valid_candidates:
+             if self.debug: print("  ⚠️ 候选股票评分均过低，放弃买入")
+             top_candidates = [] # 空列表，不买入
+        else:
+             top_candidates = valid_candidates[:50]
 
-        # 4. 评估当前持仓，决定哪些需要卖出
+        # 3. 评估现有持仓
         to_sell = []
-        for stock, info in list(self.positions.items()):
+        for stock, info in self.positions.items():
+            in_top = any(stock == c[0] for c in top_candidates[:self.position_size])
+            current_score = info.get('current_score', info.get('entry_score', 0.5))
+            score_decline = info['entry_score'] - current_score
             holding_days = (pd.to_datetime(date_str) -
                           pd.to_datetime(info['entry_date'])).days
-
-            in_top = any(stock == c[0] for c in top_candidates[:self.position_size])
-            score_decline = info['entry_score'] - info['current_score']
             long_and_poor = (holding_days >= self.force_replace_days and
-                           info['current_score'] < 0.5)
+                           current_score < 0.5)
 
             if not in_top or score_decline > self.score_threshold or long_and_poor:
                 to_sell.append(stock)
@@ -350,7 +353,7 @@ class EnhancedStrategy:
         for stock in to_sell:
             self.execute_trade(date, stock, 'sell', reason='rebalance')
 
-        # 5. 买入新股票
+        # 4. 买入新股票
         target_stocks = [c[0] for c in top_candidates[:self.position_size]
                         if c[0] not in self.positions]
 
