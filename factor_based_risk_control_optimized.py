@@ -723,7 +723,7 @@ class FactorBasedRiskControlOptimized:
 
         # 获取当日价格详细信息用于验证
         date_str = str(date)
-        
+
         # 逐笔执行
         executed = 0
         total_spent = 0
@@ -732,7 +732,7 @@ class FactorBasedRiskControlOptimized:
             shares = info['shares']
             price = info['price']
             amount = info['amount']
-            
+
             # ========== 新增修复：一字板/涨停过滤 ==========
             # 获取当日的 OHLC 数据
             stock_daily = None
@@ -741,7 +741,7 @@ class FactorBasedRiskControlOptimized:
                 # 这是一个低效但准确的方法，或者您可以在 rebalance 时传入当日详细数据
                 if hasattr(self, 'price_data') and isinstance(self.price_data, pd.DataFrame):
                     daily_row = self.price_data[
-                        (self.price_data['date'].astype(str) == date_str) & 
+                        (self.price_data['date'].astype(str) == date_str) &
                         (self.price_data['instrument'] == stock)
                     ]
                     if not daily_row.empty:
@@ -753,13 +753,13 @@ class FactorBasedRiskControlOptimized:
                 # 1. 检查是否一字涨停 (Low == High 且 涨幅 > 9%)
                 # 注意：这里需要计算涨幅，如果数据里没有pct_chg，可以用 close/open 判断
                 is_limit_up_locked = False
-                
+
                 # 简易判断：如果最高价等于最低价，且价格相对于前收盘（近似）大涨
                 if stock_daily['low'] == stock_daily['high']:
                     # 如果没有前收盘价，简单假设涨幅过大就不买
                     # 或者简单判断：开盘即最高且全天未动
                     is_limit_up_locked = True
-                
+
                 # 2. 检查是否涨停 (收盘价 == 最高价 且 涨幅 > 9.5%)
                 # 防止打板买入
                 if stock_daily['close'] == stock_daily['high']:
@@ -771,7 +771,7 @@ class FactorBasedRiskControlOptimized:
                     if self.debug:
                         print(f"    ⛔ {stock}: 疑似一字板/涨停，跳过买入 (H={stock_daily['high']}, L={stock_daily['low']})")
                     continue
-            
+
             # 3. 检查成交量
             if stock_daily is not None and 'volume' in stock_daily and stock_daily['volume'] == 0:
                  if self.debug:
@@ -797,7 +797,7 @@ class FactorBasedRiskControlOptimized:
             if shares > 10000000:  # 不应超过1000万股
                 print(f"    ❌ {stock}: 股数异常巨大 {shares:,}股")
                 continue
-            
+
             if shares % 100 != 0:  # 应为100的整数倍
                 print(f"    ❌ {stock}: 股数不是100的整数倍 {shares:,}股")
                 continue
@@ -952,7 +952,7 @@ class FactorBasedRiskControlOptimized:
                 stock for stock in target_stocks
                 if self.check_industry_concentration(stock, date_str)
             ]
-            
+
             # ========== 新增：过滤一字涨停板 ==========
             if filtered_stocks:
                 buyable_stocks = []
@@ -971,10 +971,10 @@ class FactorBasedRiskControlOptimized:
                                 row['open'] == row['high'] ==
                                 row['low'] == row['close']
                         )
-                        
+
                         # 检查是否涨停（收盘价等于最高价）
                         is_limit_up_close = (row['close'] == row['high'])
-                        
+
                         # 检查成交量
                         has_volume = (row['volume'] > 0)
 

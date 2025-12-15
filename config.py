@@ -55,7 +55,7 @@ class BacktestConfig:
 
     # 风险控制（通用）
     STOP_LOSS = -0.15  # 止损阈值
-    TAKE_PROFIT = None  # 止盈阈值（None=不止盈）
+    TAKE_PROFIT = 0.18  # 止盈阈值（None=不止盈）
     SCORE_THRESHOLD = 0.10  # 换仓阈值（v1.0使用）
     SCORE_DECAY_RATE = 1.0  # 评分衰减率（v1.0使用）
     FORCE_REPLACE_DAYS = 20  # 强制换仓天数（v1.0使用）
@@ -75,7 +75,7 @@ class RiskControlConfig:
 
     # 2. 相对排名止损
     ENABLE_RANK_STOP = True  # 启用相对排名止损
-    RANK_PERCENTILE_THRESHOLD = 0.85  # 跌出前85%止损  # 从0.80提高到0.85
+    RANK_PERCENTILE_THRESHOLD = 0.90  # 跌出前85%止损  # 从0.80提高到0.85
 
     # 3. 组合回撤保护
     MAX_PORTFOLIO_DRAWDOWN = -0.15  # 组合回撤-15%降仓
@@ -165,7 +165,7 @@ class MLConfig:
     ML_TRAIN_MONTHS = 12  # Walk-Forward训练窗口（月）
 
     # 选股参数
-    ML_MIN_SCORE = 0.6  # 最低评分阈值
+    ML_MIN_SCORE = 0.65  # 最低评分阈值
 
     # ========== 新增配置 ==========
     ML_MODEL_DIR = './models'        # 模型保存目录
@@ -347,7 +347,8 @@ def get_strategy_params():
         'max_industry_weight': RiskControlConfig.MAX_INDUSTRY_WEIGHT,
         'extreme_loss_threshold': RiskControlConfig.EXTREME_LOSS_THRESHOLD,
         'portfolio_loss_threshold': RiskControlConfig.PORTFOLIO_LOSS_THRESHOLD,
-
+        'take_profit': BacktestConfig.TAKE_PROFIT, # ✅ 传递止盈参数
+        
         # 交易成本
         'buy_cost': TradingCostConfig.BUY_COST,
         'sell_cost': TradingCostConfig.SELL_COST,
