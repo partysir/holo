@@ -96,6 +96,13 @@ class OptimalCashManager:
             # 向下取整到100股
             max_shares = int(max_shares_float / 100) * 100
 
+            # ✨ 股数合理性检查
+            if max_shares > 10000000:  # 不应超过1000万股
+                if self.debug:
+                    print(f"         ⚠️  可买股数异常巨大 {max_shares:,}股，跳过")
+                remaining_count -= 1
+                continue
+
             if max_shares < 100:
                 if self.debug:
                     print(f"         ⚠️  可买股数不足100股，跳过")
@@ -714,6 +721,9 @@ class FactorBasedRiskControlOptimized:
             buy_plan = new_plan
             print(f"    ✓ 调整为: {len(buy_plan)}只")
 
+        # 获取当日价格详细信息用于验证
+        date_str = str(date)
+        
         # 逐笔执行
         executed = 0
         total_spent = 0
@@ -722,6 +732,52 @@ class FactorBasedRiskControlOptimized:
             shares = info['shares']
             price = info['price']
             amount = info['amount']
+            
+            # ========== 新增修复：一字板/涨停过滤 ==========
+            # 获取当日的 OHLC 数据
+            stock_daily = None
+            try:
+                # 假设 self.price_data 是 DataFrame，从中获取当日数据
+                # 这是一个低效但准确的方法，或者您可以在 rebalance 时传入当日详细数据
+                if hasattr(self, 'price_data') and isinstance(self.price_data, pd.DataFrame):
+                    daily_row = self.price_data[
+                        (self.price_data['date'].astype(str) == date_str) & 
+                        (self.price_data['instrument'] == stock)
+                    ]
+                    if not daily_row.empty:
+                        stock_daily = daily_row.iloc[0]
+            except:
+                pass
+
+            if stock_daily is not None:
+                # 1. 检查是否一字涨停 (Low == High 且 涨幅 > 9%)
+                # 注意：这里需要计算涨幅，如果数据里没有pct_chg，可以用 close/open 判断
+                is_limit_up_locked = False
+                
+                # 简易判断：如果最高价等于最低价，且价格相对于前收盘（近似）大涨
+                if stock_daily['low'] == stock_daily['high']:
+                    # 如果没有前收盘价，简单假设涨幅过大就不买
+                    # 或者简单判断：开盘即最高且全天未动
+                    is_limit_up_locked = True
+                
+                # 2. 检查是否涨停 (收盘价 == 最高价 且 涨幅 > 9.5%)
+                # 防止打板买入
+                if stock_daily['close'] == stock_daily['high']:
+                     # 粗略估算涨幅：这里需要谨慎，如果没有前一天价格很难精确判断
+                     # 建议：简单起见，禁止买入当日最高价等于收盘价的股票
+                     is_limit_up_locked = True
+
+                if is_limit_up_locked:
+                    if self.debug:
+                        print(f"    ⛔ {stock}: 疑似一字板/涨停，跳过买入 (H={stock_daily['high']}, L={stock_daily['low']})")
+                    continue
+            
+            # 3. 检查成交量
+            if stock_daily is not None and 'volume' in stock_daily and stock_daily['volume'] == 0:
+                 if self.debug:
+                        print(f"    ⛔ {stock}: 停牌或无成交量，跳过")
+                 continue
+            # ============================================
 
             # 验证1：现金充足
             if amount > self.cash:
@@ -736,7 +792,17 @@ class FactorBasedRiskControlOptimized:
                 print(f"       重算: ¥{expected:,.0f}")
                 continue
 
-            # ✅ 验证3已删除：信任 calculate_buy_plan 的分配结果
+            # ✅ 验证3：股数合理性检查（新增）
+            # A股交易股数应为100的整数倍，且不应超过合理范围
+            if shares > 10000000:  # 不应超过1000万股
+                print(f"    ❌ {stock}: 股数异常巨大 {shares:,}股")
+                continue
+            
+            if shares % 100 != 0:  # 应为100的整数倍
+                print(f"    ❌ {stock}: 股数不是100的整数倍 {shares:,}股")
+                continue
+
+            # ✅ 验证4已删除：信任 calculate_buy_plan 的分配结果
             # （calculate_buy_plan 已经做了完整的资金分配和验证）
 
             # 记录买入前现金
@@ -745,7 +811,7 @@ class FactorBasedRiskControlOptimized:
             # 扣除现金
             self.cash -= amount
 
-            # 验证4：现金非负
+            # 验证5：现金非负
             if self.cash < 0:
                 print(f"    ❌ {stock}: 导致现金为负")
                 print(f"       买入前: ¥{cash_before:,.0f}")
@@ -886,6 +952,41 @@ class FactorBasedRiskControlOptimized:
                 stock for stock in target_stocks
                 if self.check_industry_concentration(stock, date_str)
             ]
+            
+            # ========== 新增：过滤一字涨停板 ==========
+            if filtered_stocks:
+                buyable_stocks = []
+                for stock in filtered_stocks:
+                    # 检查是否为一字板（开=高=低=收）
+                    # 需要从原始数据获取OHLC
+                    stock_data = self.price_data[
+                        (self.price_data['instrument'] == stock) &
+                        (self.price_data['date'] == date_str)
+                        ]
+
+                    if len(stock_data) > 0:
+                        row = stock_data.iloc[0]
+                        # 检查是否为一字板（开=高=低=收）
+                        is_limit_up = (
+                                row['open'] == row['high'] ==
+                                row['low'] == row['close']
+                        )
+                        
+                        # 检查是否涨停（收盘价等于最高价）
+                        is_limit_up_close = (row['close'] == row['high'])
+                        
+                        # 检查成交量
+                        has_volume = (row['volume'] > 0)
+
+                        # 只有不满足涨停条件且有成交量的股票才会被买入
+                        if not (is_limit_up or is_limit_up_close) and has_volume:
+                            buyable_stocks.append(stock)
+                    else:
+                        # 如果没有数据，默认允许买入
+                        buyable_stocks.append(stock)
+
+                filtered_stocks = buyable_stocks
+            # ======================================
 
             if filtered_stocks:
                 # 7. ✨ 使用最佳现金管理计算买入计划
@@ -909,6 +1010,7 @@ class FactorBasedRiskControlOptimized:
             # ✅ v2.3 新增：验证现金非负
             if self.cash < 0:
                 raise ValueError(f"现金为负：¥{self.cash:,.2f}")
+
 
     # ========== 计算方法 ==========
 

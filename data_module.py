@@ -253,7 +253,14 @@ class TushareDataSource:
                 print(f"  🚫 特殊板块过滤: {special_filtered} 只 (科创板/创业板/北交所)")
 
             stock_codes = df['ts_code'].tolist()
-            print(f"✓ 最终获取 {len(stock_codes)} 只符合条件的股票")
+            
+            # ✅ 新增：黑名单过滤 (过滤掉已知的数据异常股票)
+            # 302132 是您数据里的鬼影代码，实际是 300114
+            blacklist = ['302132.SZ', '302132', '600200.SH'] # 600200在最后几天有11亿股的异常买入，建议先屏蔽
+            
+            stock_codes = [c for c in stock_codes if c not in blacklist]
+            
+            print(f"✓ 最终获取 {len(stock_codes)} 只符合条件的股票 (已剔除黑名单)")
 
             return stock_codes
 
@@ -278,6 +285,8 @@ class TushareDataSource:
         for attempt in range(max_retries):
             try:
                 self.rate_limiter.wait_if_needed()
+                # ✅ 显式指定使用不复权数据进行回测
+                # 这样可以确保买入和卖出使用同一套价格体系，避免收益虚高
                 df = self.pro.daily(
                     ts_code=ts_code,
                     start_date=start_date.replace('-', ''),
@@ -717,6 +726,17 @@ class StockRankerModel:
         
         # 清理
         del min_score, max_score
+        
+        # ✅ 新增：将一字涨停或涨停的股票分数置零
+        # 条件：最高价=最低价 (一字板) 或 收盘价=最高价 (可能的涨停)
+        # 注意：这可能会误杀一些强势股，但在回测中“宁可错杀不可买入”
+        if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
+            limit_up_mask = (df['high'] == df['low']) | (df['close'] == df['high'])
+            
+            # 将这些股票的分数设为 0，确保不会被选中
+            df.loc[limit_up_mask, 'position'] = 0
+            
+            print(f"  ⚠️ 已剔除 {limit_up_mask.sum()} 条疑似涨停数据")
         
         print("✓ 评分计算完成")
         return df

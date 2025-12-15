@@ -24,15 +24,22 @@ from data_module_incremental import load_data_with_incremental_update
 # 机器学习因子评分模块
 ML_AVAILABLE = False
 try:
-    from ml_factor_scoring_fixed import (
-        MLFactorScorer,
-        IndustryBasedScorer,
-        EnhancedStockSelector
-    )
+    from ml_factor_scoring_integrated import UltraMLScorer as MLFactorScorer
+    # 为保持兼容性，创建别名
+    IndustryBasedScorer = MLFactorScorer
+    EnhancedStockSelector = MLFactorScorer
     ML_AVAILABLE = True
 except ImportError:
-    print("⚠️  机器学习模块未找到，使用基础因子评分")
-    ML_AVAILABLE = False
+    try:
+        from ml_factor_scoring_fixed import (
+            MLFactorScorer,
+            IndustryBasedScorer,
+            EnhancedStockSelector
+        )
+        ML_AVAILABLE = True
+    except ImportError:
+        print("⚠️  机器学习模块未找到，使用基础因子评分")
+        ML_AVAILABLE = False
 
 from enhanced_strategy import run_enhanced_strategy
 

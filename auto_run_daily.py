@@ -55,11 +55,16 @@ except ImportError:
 # 尝试导入ML模块
 ML_AVAILABLE = False
 try:
-    from ml_factor_scoring_fixed import AdvancedMLScorer, EnhancedStockSelector
-
+    from ml_factor_scoring_integrated import UltraMLScorer as AdvancedMLScorer
+    # 为保持兼容性，创建别名
+    EnhancedStockSelector = AdvancedMLScorer
     ML_AVAILABLE = True
 except ImportError:
-    pass
+    try:
+        from ml_factor_scoring_fixed import AdvancedMLScorer, EnhancedStockSelector
+        ML_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 def run_daily_task():

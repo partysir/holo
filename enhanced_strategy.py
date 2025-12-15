@@ -198,6 +198,12 @@ class EnhancedStrategy:
             # ✨ A股整百股限制
             shares = int(shares / 100) * 100 if shares is not None else 0
 
+            # ✨ 股数合理性检查
+            if shares > 10000000:  # 不应超过1000万股
+                if self.debug:
+                    print(f"    ❌ 股数异常巨大 {shares:,}股，放弃买入")
+                return False
+
             if shares < 100:  # ✨ 至少100股
                 if self.debug:
                     print(f"    ❌ 股数不足100股，放弃买入")
