@@ -1,19 +1,16 @@
 """
-main.py - 主回测入口（v2.8 - 集成舆情风控版）
+main.py - 主回测入口（v2.6 - 实盘精选版 Top5）
 
 核心更新：
-✅ 数据泄露修复: 严格隔离预测列，防止position/ml_score污染训练数据
-✅ API适配优化: 完整适配 ml_factor_scoring_fixed.py 的新接口
-✅ 特征验证: 添加泄露检测，确保模型使用真实因子
-✅ 实盘清单优化: 仅输出评分最高的 Top 5 股票
-✅ 全流程保留: Walk-Forward 全窗口训练、前视偏差修复
-✅ 舆情风控集成: 一票否决 + 加分提权，提升选股质量
+✅ 实盘清单优化: 仅输出评分最高的 Top 5 股票，便于聚焦
+✅ 全流程保留: 包含前视偏差修复、Walk-Forward 全窗口训练、XGBoost 兼容性修复
 
-版本：v2.8
-日期：2025-12-17
+版本：v2.6
+日期：2025-12-15
 """
 
 import warnings
+
 warnings.filterwarnings('ignore')
 
 import time
@@ -47,42 +44,33 @@ ts.set_token(TUSHARE_TOKEN)
 from data_module import DataCache, TushareDataSource
 from data_module_incremental import load_data_with_incremental_update
 
-# ========== 导入高级ML模块 (修复版) ==========
+# ========== 导入高级ML模块 (适配 ml_factor_scoring_fixed.py) ==========
 ML_AVAILABLE = False
 try:
+    # 注意：确保目录下有 ml_factor_scoring_fixed.py 文件
     from ml_factor_scoring_fixed import (
         AdvancedMLScorer,
         ICCalculator,
         IndustryBasedScorer,
         EnhancedStockSelector
     )
+
     ML_AVAILABLE = True
-    print("✓ 高级ML模块加载成功 (ml_factor_scoring_fixed - 数据泄露修复版)")
+    print("✓ 高级ML模块加载成功 (ml_factor_scoring_fixed)")
 except ImportError as e:
     print(f"⚠️  高级ML模块未找到: {e}")
     ML_AVAILABLE = False
 
-# ========== 【新增】导入舆情风控模块 ==========
-SENTIMENT_AVAILABLE = False
-try:
-    from sentiment_risk_control import (
-        apply_sentiment_control,
-        SentimentRiskController
-    )
-    SENTIMENT_AVAILABLE = True
-    print("✓ 舆情风控模块加载成功")
-except ImportError as e:
-    print(f"⚠️  舆情风控模块未加载: {e}")
-    SENTIMENT_AVAILABLE = False
-
 # ========== 导入策略引擎 ==========
 try:
     from factor_based_risk_control_optimized import run_factor_based_strategy_v2
+
     print("✓ v2.1优化版策略引擎加载成功")
     STRATEGY_VERSION = "v2.0"
 except ImportError:
     print("⚠️  v2.0优化版未找到，使用v1.0")
     from factor_based_risk_control import run_factor_based_strategy
+
     STRATEGY_VERSION = "v1.0"
 
 from visualization_module import (
@@ -97,71 +85,14 @@ from date_organized_reports import generate_date_organized_reports
 
 def print_banner():
     """打印启动横幅"""
-    print("\n" + "="*80)
-    print("    综合因子评分选股回测系统 v2.8 - 集成舆情风控版")
-    print("="*80)
+    print("\n" + "=" * 80)
+    print("    综合因子评分选股回测系统 v2.6 - 实盘精选版 (Top 5)")
+    print("=" * 80)
     print("\n🎯 核心特性:")
-    print("  ✅ 数据泄露严格防护 (position/ml_score 隔离)")
     print("  ✅ 全历史窗口滚动训练 (Robust Walk-Forward)")
-    print("  ✅ 舆情风控增强 (一票否决 + 加分提权)")
     print("  ✅ 实盘 Top 5 精选推荐")
     print("  ✅ 前视偏差严格防护")
     print()
-
-
-def validate_no_leakage(factor_data: pd.DataFrame, ml_scorer=None) -> bool:
-    """
-    🔍 验证是否存在数据泄露
-
-    Returns:
-        bool: True表示验证通过，False表示检测到泄露
-    """
-    print("\n" + "="*80)
-    print("🔍 数据泄露验证")
-    print("="*80)
-
-    issues = []
-
-    # 检查1: 特征重要性中是否包含泄露列
-    if ml_scorer is not None:
-        try:
-            importance = ml_scorer.get_feature_importance()
-            if importance is not None:
-                leaked_features = importance[
-                    importance['feature'].str.contains(
-                        'position|ml_score|score_rank|composite_score',
-                        case=False,
-                        na=False
-                    )
-                ]
-                if len(leaked_features) > 0:
-                    issues.append(f"特征重要性中发现泄露列: {leaked_features['feature'].tolist()}")
-        except Exception as e:
-            print(f"  ⚠️  无法检查特征重要性: {e}")
-
-    # 检查2: 训练特征列表
-    if ml_scorer is not None and hasattr(ml_scorer, 'feature_names'):
-        feature_names = ml_scorer.feature_names or []
-        leaked_in_features = [f for f in feature_names
-                             if any(leak in f.lower() for leak in ['position', 'ml_score', 'score_rank', 'composite'])]
-        if leaked_in_features:
-            issues.append(f"训练特征中发现泄露列: {leaked_in_features}")
-
-    # 检查3: factor_data 中的可疑列
-    suspicious_cols = [c for c in factor_data.columns
-                      if any(leak in c.lower() for leak in ['position', 'ml_score', 'score_rank'])]
-    if suspicious_cols:
-        print(f"  ℹ️  factor_data 包含预测列: {suspicious_cols} (这是正常的，用于回测)")
-
-    # 输出结果
-    if issues:
-        print("\n  ❌ 检测到数据泄露问题:")
-        for issue in issues:
-            print(f"     • {issue}")
-        return False
-    else:
-        print("  ✅ 验证通过：未检测到数据泄露")
-        return True
 
 
 def print_trading_plan(context, price_data, factor_data):
@@ -171,9 +102,9 @@ def print_trading_plan(context, price_data, factor_data):
     if context is None:
         return
 
-    print("\n" + "#"*80)
+    print("\n" + "#" * 80)
     print("📋 步骤9: 交易指令与持仓监控 (回测模拟结果)")
-    print("#"*80 + "\n")
+    print("#" * 80 + "\n")
 
     df_trades = context.get('trade_records', pd.DataFrame())
     if df_trades.empty:
@@ -200,7 +131,8 @@ def print_trading_plan(context, price_data, factor_data):
             shares_val = row['shares'] if pd.notnull(row['shares']) else 0
             amount_val = row['amount'] if pd.notnull(row['amount']) else 0
 
-            print(f"{action:<6} | {row['stock']:<10} | {price_val:<8.2f} | {shares_val:<8.0f} | ¥{amount_val:<9.0f} | {row.get('reason', '')}")
+            print(
+                f"{action:<6} | {row['stock']:<10} | {price_val:<8.2f} | {shares_val:<8.0f} | ¥{amount_val:<9.0f} | {row.get('reason', '')}")
         print("-" * 75)
 
     # 打印当前持仓详情
@@ -213,7 +145,8 @@ def print_trading_plan(context, price_data, factor_data):
     else:
         print(f"\n💼 【当前持仓监控】 共 {len(positions)} 只")
         print("-" * 95)
-        print(f"{'代码':<10} | {'持仓股数':<8} | {'成本价':<8} | {'现价':<8} | {'浮动盈亏':<10} | {'收益率':<8} | {'评分'}")
+        print(
+            f"{'代码':<10} | {'持仓股数':<8} | {'成本价':<8} | {'现价':<8} | {'浮动盈亏':<10} | {'收益率':<8} | {'评分'}")
         print("-" * 95)
 
         total_mv = 0
@@ -221,8 +154,8 @@ def print_trading_plan(context, price_data, factor_data):
 
         # 获取最后一天的数据用于展示
         try:
-            # 🔧 修复：优先使用 ml_score，fallback 到 position
-            score_col = 'ml_score' if 'ml_score' in factor_data.columns else 'position'
+            # 兼容处理：检查评分列名是 'position' 还是 'ml_score'
+            score_col = 'position' if 'position' in factor_data.columns else 'ml_score'
 
             # 确保日期格式一致
             last_date_str = str(last_date).split(' ')[0]
@@ -231,7 +164,8 @@ def print_trading_plan(context, price_data, factor_data):
             else:
                 mask_factor = factor_data['date'] == pd.Timestamp(last_date_str)
 
-            last_scores = factor_data[mask_factor][['instrument', score_col]].set_index('instrument')[score_col].to_dict()
+            last_scores = factor_data[mask_factor][['instrument', score_col]].set_index('instrument')[
+                score_col].to_dict()
 
             if isinstance(price_data['date'].iloc[0], str):
                 mask_price = price_data['date'].str.startswith(last_date_str)
@@ -240,13 +174,14 @@ def print_trading_plan(context, price_data, factor_data):
 
             last_prices = price_data[mask_price][['instrument', 'close']].set_index('instrument')['close'].to_dict()
         except Exception as e:
+            # print(f"DEBUG: 获取最后一日数据失败 {e}")
             last_scores = {}
             last_prices = {}
 
         for code, info in positions.items():
             shares = info['shares']
             cost = info['cost']
-            current_price = last_prices.get(code, cost)
+            current_price = last_prices.get(code, cost)  # 如果没有现价，暂用成本价代替
             score = last_scores.get(code, 0.0)
 
             mv = shares * current_price
@@ -259,7 +194,8 @@ def print_trading_plan(context, price_data, factor_data):
             pnl_str = f"¥{pnl:+,.0f}"
             rate_str = f"{pnl_rate:+.2%}"
 
-            print(f"{code:<10} | {shares:<8.0f} | {cost:<8.2f} | {current_price:<8.2f} | {pnl_str:<10} | {rate_str:<8} | {score:.4f}")
+            print(
+                f"{code:<10} | {shares:<8.0f} | {cost:<8.2f} | {current_price:<8.2f} | {pnl_str:<10} | {rate_str:<8} | {score:.4f}")
 
         print("-" * 95)
         cash = final_value - total_mv
@@ -295,7 +231,7 @@ def main():
         SAMPLE_SIZE = 5000
 
     # ========== 关键新增：最短上市时间参数 ==========
-    MIN_DAYS_LISTED = 180
+    MIN_DAYS_LISTED = 180  # 要求股票至少上市180天（半年）
     print(f"\n🔒 前视偏差防护:")
     print(f"  - 最短上市时间: {MIN_DAYS_LISTED} 天")
     print(f"  - 效果: 剔除在 {START_DATE} 前 {MIN_DAYS_LISTED} 天内上市的次新股")
@@ -306,9 +242,9 @@ def main():
     # 步骤0: 获取大盘指数
     benchmark_data = None
     try:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("📈 步骤0: 获取大盘指数数据 (用于择时)")
-        print("="*80)
+        print("=" * 80)
         ds_temp = TushareDataSource(cache_manager=cache_manager, token=TUSHARE_TOKEN)
         benchmark_data = ds_temp.get_index_daily(ts_code='000001.SH', start_date=START_DATE, end_date=END_DATE)
         if benchmark_data is not None:
@@ -319,10 +255,12 @@ def main():
     # ============ 步骤1: 数据加载（修复版） ============
     try:
         data_start_time = time.time()
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("📦 步骤1: 数据加载 (v2.3 - 修复前视偏差)")
-        print("="*80)
+        print("=" * 80)
 
+        # ========== 使用增量更新模块加载数据 ==========
+        # 注意：load_data_with_incremental_update 需要在内部支持 min_days_listed 参数
         factor_data, price_data = load_data_with_incremental_update(
             START_DATE,
             END_DATE,
@@ -336,7 +274,7 @@ def main():
             use_sampling=USE_SAMPLING,
             sample_size=SAMPLE_SIZE,
             max_workers=DataConfig.MAX_WORKERS,
-            min_days_listed=MIN_DAYS_LISTED
+            min_days_listed=MIN_DAYS_LISTED  # ✅ 关键参数：传递给数据加载器
         )
 
         if factor_data is None or price_data is None:
@@ -354,7 +292,9 @@ def main():
         unique_stocks = factor_data['instrument'].unique()
         print(f"  - 股票池大小: {len(unique_stocks)} 只")
 
-        new_stock_codes = [s for s in unique_stocks if s.startswith(('920', '8', '4'))]
+        # 检查是否有新股代码（920北交所、689科创板部分等，视需求过滤）
+        # 这里仅作提示，不强制删除，因为 data_module 应该已经处理了 min_days_listed
+        new_stock_codes = [s for s in unique_stocks if s.startswith(('920', '8', '4'))]  # 示例：检查北交所等
         if new_stock_codes:
             print(f"  ℹ️  提示：包含 {len(new_stock_codes)} 只北交所/新三板代码")
 
@@ -366,9 +306,9 @@ def main():
         return
 
     # ============ 步骤1.5: 补全行业数据 ============
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("🏭 步骤1.5: 补全行业数据 (用于中性化)")
-    print("="*80)
+    print("=" * 80)
 
     try:
         ds = TushareDataSource(token=TUSHARE_TOKEN, cache_manager=cache_manager)
@@ -392,9 +332,9 @@ def main():
 
     # ============ 步骤2: 数据质量优化 ============
     try:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("🔍 步骤2: 数据质量优化")
-        print("="*80)
+        print("=" * 80)
         from data_quality_optimizer import optimize_data_quality
         price_data, factor_data = optimize_data_quality(price_data, factor_data, cache_manager=cache_manager)
     except Exception as e:
@@ -402,19 +342,21 @@ def main():
 
     # ============ 步骤3: 因子增强处理 ============
     try:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("🎯 步骤3: 因子增强处理")
-        print("="*80)
+        print("=" * 80)
 
         from enhanced_factor_processor import EnhancedFactorProcessor
 
         factor_processor = EnhancedFactorProcessor(
-            neutralize_industry=True,
+            neutralize_industry=True,  # 现在已有行业数据，可以安全开启
             neutralize_market=False
         )
 
         exclude_columns = ['date', 'instrument', 'open', 'high', 'low', 'close', 'volume', 'amount', 'industry']
         factor_columns = [col for col in factor_data.columns if col not in exclude_columns]
+
+        # 确保只处理数值列
         factor_columns = [c for c in factor_columns if pd.api.types.is_numeric_dtype(factor_data[c])]
 
         print(f"  检测到 {len(factor_columns)} 个有效因子列")
@@ -426,26 +368,12 @@ def main():
         print(f"\n⚠️  因子增强处理警告: {e}")
         traceback.print_exc()
 
-    # ============ 步骤4: ML因子评分 (🔧 完整修复版) ============
-    ml_scorer = None  # 用于后续验证
-
+    # ============ 步骤4: ML因子评分 (✅ 修复并适配新API) ============
     if MLConfig.USE_ADVANCED_ML and ML_AVAILABLE:
         try:
-            print("\n" + "="*80)
-            print("🚀 步骤4: 高级ML因子评分 (Walk-Forward 训练模式 - 数据泄露修复版)")
-            print("="*80)
-
-            # 🔧 修复点1: 训练前清理污染列
-            print("   [0/4] 清理潜在污染列...")
-            污染列 = ['ml_score', 'position', 'score_rank', 'composite_score',
-                    'composite_score_neutral', 'score_rank_neutral', 'industry_rank']
-
-            # 保存原始factor_data（用于后续合并预测结果）
-            factor_data_clean = factor_data.copy()
-            for col in 污染列:
-                if col in factor_data_clean.columns:
-                    factor_data_clean = factor_data_clean.drop(columns=[col])
-                    print(f"      ✓ 删除污染列: {col}")
+            print("\n" + "=" * 80)
+            print("🚀 步骤4: 高级ML因子评分 (Walk-Forward 训练模式)")
+            print("=" * 80)
 
             # 1. 初始化评分器
             ml_scorer = AdvancedMLScorer(
@@ -454,46 +382,28 @@ def main():
                 top_percentile=MLConfig.ML_TOP_PERCENTILE,
                 use_classification=MLConfig.ML_USE_CLASSIFICATION,
                 use_ic_features=MLConfig.ML_USE_IC_FEATURES,
-                use_active_return=True,
+                use_active_return=True,  # 开启超额收益目标
                 train_months=MLConfig.ML_TRAIN_MONTHS
             )
 
-            # 2. 准备训练数据（使用清理后的数据）
-            print("   [1/4] 准备训练数据...")
+            # 2. 准备训练数据 (计算IC特征、标注标签、处理缺失值)
+            print("   [1/3] 准备训练数据...")
             X, y, merged_df = ml_scorer.prepare_training_data(
-                factor_data_clean,  # 🔧 使用清理后的数据
+                factor_data,
                 price_data,
                 factor_columns
             )
 
             # 3. 执行 Walk-Forward 滚动训练
-            print("   [2/4] 执行 Walk-Forward 滚动训练 (全历史窗口)...")
+            print("   [2/3] 执行 Walk-Forward 滚动训练 (全历史窗口)...")
+            # ✅ 修改：n_splits=None 表示训练所有可用的历史窗口，最稳健
             ml_scorer.train_walk_forward(X, y, merged_df, n_splits=None)
 
             # 4. 预测评分
-            print("   [3/4] 全量数据预测评分...")
-            # 🔧 修复点2: 预测返回的是独立的结果DataFrame
-            factor_data_predicted = ml_scorer.predict_scores(merged_df)
-
-            # 🔧 修复点3: 只合并预测列，保持原始factor_data干净
-            print("   [4/4] 合并预测结果...")
-            # 删除factor_data中可能存在的旧预测列
-            for col in ['ml_score', 'position']:
-                if col in factor_data.columns:
-                    factor_data = factor_data.drop(columns=[col])
-
-            # 只合并必要的预测列
-            prediction_cols = ['date', 'instrument', 'ml_score', 'position']
-            prediction_df = factor_data_predicted[prediction_cols]
-
-            # 合并到原始factor_data
-            factor_data = factor_data.merge(
-                prediction_df,
-                on=['date', 'instrument'],
-                how='left'
-            )
-
-            print(f"      ✓ 成功添加预测列: ml_score, position")
+            print("   [3/3] 全量数据预测评分...")
+            # 覆盖原始 factor_data，因为 ml_scorer 返回的 dataframe 包含了 'position', 'ml_score' 等新列
+            # 同时也包含了计算出来的 IC 特征
+            factor_data = ml_scorer.predict_scores(merged_df)
 
             # 打印特征重要性
             importance = ml_scorer.get_feature_importance(top_n=10)
@@ -505,97 +415,24 @@ def main():
         except Exception as e:
             print(f"⚠️  ML评分流程失败: {e}")
             traceback.print_exc()
-            # 容错：如果ML失败，使用等权评分
+            # 如果 ML 失败，factor_data 保持原样，后续流程可能会因为缺少 score 列而报错
+            # 这里做一个简单的容错：如果缺少 position 列，用等权合成
             if 'position' not in factor_data.columns and len(factor_columns) > 0:
-                 print("   ⚠️ 启用备用评分方案：因子等权平均")
-                 factor_data['position'] = factor_data[factor_columns].mean(axis=1)
-                 factor_data['position'] = factor_data.groupby('date')['position'].rank(pct=True)
-
-    # ============ 步骤4.5: 数据泄露验证 ============
-    validate_no_leakage(factor_data, ml_scorer)
-
-    # ============ 【新增】步骤5: 舆情风控/增强 ============
-    if SENTIMENT_AVAILABLE:
-        try:
-            print("\n" + "="*80)
-            print("🛡️  步骤5: 舆情风控/增强")
-            print("="*80)
-
-            # 对最新日期的所有股票进行舆情过滤
-            latest_date = factor_data['date'].max()
-            latest_mask = factor_data['date'] == latest_date
-            latest_stocks = factor_data[latest_mask].copy()
-
-            print(f"\n  📊 舆情分析对象: {len(latest_stocks)} 只股票")
-            print(f"  📅 分析日期: {latest_date}")
-
-            # 应用舆情风控
-            filtered_latest = apply_sentiment_control(
-                selected_stocks=latest_stocks,
-                factor_data=factor_data,
-                price_data=price_data,
-                tushare_token=TUSHARE_TOKEN,
-                cache_manager=cache_manager,  # 传入缓存管理器
-                enable_veto=True,    # 启用一票否决
-                enable_boost=True,   # 启用加分增强
-                lookback_days=30     # 回溯30天舆情
-            )
-
-            # 更新factor_data（只更新最新日期的数据）
-            # 删除被否决的股票
-            removed_stocks = set(latest_stocks['instrument']) - set(filtered_latest['instrument'])
-            if removed_stocks:
-                print(f"\n  🚫 剔除风险股票: {len(removed_stocks)} 只")
-                for stock in list(removed_stocks)[:5]:  # 只打印前5个
-                    industry = latest_stocks[latest_stocks['instrument']==stock]['industry'].values
-                    ind_str = industry[0] if len(industry) > 0 else '未知'
-                    print(f"     • {stock} ({ind_str})")
-                if len(removed_stocks) > 5:
-                    print(f"     ... 还有 {len(removed_stocks) - 5} 只")
-
-                # 从factor_data中删除被否决的股票
-                factor_data = factor_data[
-                    ~((factor_data['date'] == latest_date) &
-                      (factor_data['instrument'].isin(removed_stocks)))
-                ]
-
-            # 更新评分（如果有加分的股票）
-            score_col = 'ml_score' if 'ml_score' in factor_data.columns else 'position'
-            boost_count = 0
-
-            for _, row in filtered_latest.iterrows():
-                stock = row['instrument']
-                new_score = row[score_col]
-
-                # 更新factor_data中对应股票的评分
-                mask = (factor_data['date'] == latest_date) & (factor_data['instrument'] == stock)
-                if mask.any():
-                    old_score = factor_data.loc[mask, score_col].values[0]
-                    if abs(new_score - old_score) > 0.01:  # 有明显变化
-                        factor_data.loc[mask, score_col] = new_score
-                        boost_count += 1
-
-            if boost_count > 0:
-                print(f"\n  📈 加分提权: {boost_count} 只股票评分已提升")
-
-            print(f"\n  ✅ 舆情风控完成，数据已更新")
-            print(f"     原始: {len(latest_stocks)} 只 → 过滤后: {len(filtered_latest)} 只")
-
-        except Exception as e:
-            print(f"\n  ⚠️  舆情风控出错: {e}")
-            print(f"  将继续使用原始数据")
-            traceback.print_exc()
+                print("   ⚠️ 启用备用评分方案：因子等权平均")
+                factor_data['position'] = factor_data[factor_columns].mean(axis=1).rank(pct=True)
 
     # ========== 步骤7: 运行回测引擎 ==========
     context = None
     try:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print(f"🚀 步骤7: {STRATEGY_VERSION} 回测引擎 (含择时)")
-        print("="*80)
+        print("=" * 80)
 
         strategy_params = get_strategy_params()
+        # 添加调仓周期参数
         strategy_params['rebalance_days'] = REBALANCE_DAYS
 
+        # 运行回测
         context = run_factor_based_strategy_v2(
             factor_data=factor_data,
             price_data=price_data,
@@ -610,23 +447,19 @@ def main():
 
     # ============ 步骤8: 生成报告 ============
     try:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("📊 步骤8: 生成分析报告")
-        print(f"{'='*80}\n")
+        print(f"{'=' * 80}\n")
 
-        # 🔧 修复：使用统一的输出目录，防止重复调用
-        output_dir = OutputConfig.REPORTS_DIR
-
-        # 生成日期组织报告
+        # 生成按日期组织的文件夹
         date_folder = generate_date_organized_reports(
             context=context,
             factor_data=factor_data,
             price_data=price_data,
-            base_dir=output_dir
+            base_dir=OutputConfig.REPORTS_DIR
         )
 
-        # 🔧 修复：只调用一次持仓面板生成函数
-        # 注意：不要在循环中调用此函数
+        # 生成持仓面板
         show_today_holdings_dashboard(
             context=context,
             factor_data=factor_data,
@@ -638,23 +471,28 @@ def main():
         print(f"⚠️  报告生成警告: {e}")
         traceback.print_exc()
 
-    # ============ 步骤9: 打印交易计划 ============
+    # ============ 步骤9: 打印交易计划 (启用) ============
     print_trading_plan(context, price_data, factor_data)
 
-    # ========== 步骤10: 实盘建仓专用清单 (Top 5) ==========
-    print("\n" + "="*80)
+    # ========== 【新增】实盘建仓专用清单 (Top 5) ==========
+    print("\n" + "=" * 80)
     print("🚀 实盘建仓推荐清单 (最新日期 Top 5)")
-    print("="*80)
+    print("=" * 80)
 
+    # 1. 获取最新一个交易日的数据
     latest_date = factor_data['date'].max()
     print(f"📅 数据截止日期: {latest_date}")
 
+    # 2. 筛选当天的股票并按评分排序
+    # 注意：确保这里使用的是经过 ML 预测后的 factor_data
     latest_stocks = factor_data[factor_data['date'] == latest_date].copy()
 
-    # 🔧 修复：优先使用 ml_score
-    score_col = 'ml_score' if 'ml_score' in latest_stocks.columns else 'position'
+    # 兼容字段名
+    score_col = 'position' if 'position' in latest_stocks.columns else 'ml_score'
 
     if score_col in latest_stocks.columns:
+        # 过滤停牌或一字板（如果有价格数据辅助判断更好，这里主要按分数排）
+        # ✅ 修改：这里改成了 Top 5
         target_stocks = latest_stocks.sort_values(by=score_col, ascending=False).head(5)
 
         print(f"{'排名':<6} | {'代码':<10} | {'行业':<10} | {'ML评分':<10}")
@@ -667,22 +505,17 @@ def main():
             print(f"{idx:<6} | {stock:<10} | {industry:<10} | {score:.4f}")
 
         print("-" * 50)
-
-        if SENTIMENT_AVAILABLE:
-            print("\n✅ 此清单已通过舆情风控过滤：")
-            print("   • 已剔除立案调查、ST等风险股票")
-            print("   • 已对政策题材股票进行加分提权")
-
-        print("\n💡 实盘操作建议：")
+        print("💡 实盘操作建议：")
         print("1. 此清单为全市场评分最高的 5 只股票。")
         print("2. 建议开盘后观察，若未停牌且未涨停，可直接买入。")
         print("3. 如遇不可买入情况，请顺延至第 6 名（需自行查看数据）。")
     else:
         print("❌ 无法生成推荐清单：未找到评分字段")
 
-    print("\n" + "="*80)
-    print("✅ 任务全部完成 - 集成舆情风控版")
-    print("="*80 + "\n")
+    print("\n" + "=" * 80)
+    print("✅ 任务全部完成")
+    print("=" * 80 + "\n")
+
 
 if __name__ == "__main__":
     try:

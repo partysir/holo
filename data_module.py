@@ -28,9 +28,6 @@ except ImportError:
     TUSHARE_AVAILABLE = False
     print("⚠️  Tushare未安装: pip install tushare")
 
-# 导入资金流因子计算器
-from money_flow_factors import MoneyFlowFactorCalculator, integrate_money_flow_to_stockranker
-
 
 # ========== 第1部分：基础工具类 ==========
 
@@ -253,14 +250,7 @@ class TushareDataSource:
                 print(f"  🚫 特殊板块过滤: {special_filtered} 只 (科创板/创业板/北交所)")
 
             stock_codes = df['ts_code'].tolist()
-            
-            # ✅ 新增：黑名单过滤 (过滤掉已知的数据异常股票)
-            # 302132 是您数据里的鬼影代码，实际是 300114
-            blacklist = ['302132.SZ', '302132', '600200.SH'] # 600200在最后几天有11亿股的异常买入，建议先屏蔽
-            
-            stock_codes = [c for c in stock_codes if c not in blacklist]
-            
-            print(f"✓ 最终获取 {len(stock_codes)} 只符合条件的股票 (已剔除黑名单)")
+            print(f"✓ 最终获取 {len(stock_codes)} 只符合条件的股票")
 
             return stock_codes
 
@@ -285,8 +275,6 @@ class TushareDataSource:
         for attempt in range(max_retries):
             try:
                 self.rate_limiter.wait_if_needed()
-                # ✅ 显式指定使用不复权数据进行回测
-                # 这样可以确保买入和卖出使用同一套价格体系，避免收益虚高
                 df = self.pro.daily(
                     ts_code=ts_code,
                     start_date=start_date.replace('-', ''),
@@ -549,94 +537,30 @@ class TushareDataSource:
 # ========== 第3部分：StockRanker 多因子评分模型 ==========
 
 class StockRankerModel:
-    """StockRanker 多因子评分模型 (内存优化版)"""
+    """StockRanker 多因子评分模型 (扩展版)"""
 
-    def __init__(self, custom_weights=None, use_fundamental=True, use_money_flow=True, money_flow_style='balanced'):
+    def __init__(self, custom_weights=None, use_fundamental=True):
         self.use_fundamental = use_fundamental
-        self.use_money_flow = use_money_flow
-        self.money_flow_style = money_flow_style
-        
-        # 初始化资金流计算器
-        if self.use_money_flow:
-            from money_flow_factors import MoneyFlowFactorCalculator
-            self.money_flow_calculator = MoneyFlowFactorCalculator(
-                use_full_tick_data=False,
-                keep_only_essential=True  # ✅ 关键：仅保留核心因子
-            )
-            
-            # 获取推荐的资金流因子权重
-            money_flow_weights = self.money_flow_calculator.get_recommended_weights(money_flow_style)
-        else:
-            money_flow_weights = {}
-        
         if custom_weights:
             self.factor_weights = custom_weights
         else:
-            # 基础因子权重（根据是否启用资金流调整）
-            base_weights = {}
-            
-            if use_fundamental and use_money_flow:
-                # 基本面 + 资金流模式（推荐）
-                base_weights = {
-                    # 估值因子（权重从25%降到15%）
-                    'pe_ratio': -0.06, 'pb_ratio': -0.06, 'ps_ratio': -0.03,
-                    
-                    # 波动率（权重从15%降到10%）
-                    'volatility_20d': -0.05, 'volatility_60d': -0.05,
-                    
-                    # 成交量（权重从15%降到10%）
-                    'money_flow_20d': 0.05, 'volume_ratio': 0.05,
-                    
-                    # 动量（权重从15%降到12%）
-                    'return_20d': 0.06, 'return_60d': 0.06,
-                    
-                    # 基本面（权重从30%降到25%）
-                    'roe': 0.08, 'roa': 0.04,
-                    'gross_margin': 0.04, 'net_margin': 0.04,
-                    'debt_ratio': -0.05,
-                }
-                # 资金流权重（28%，从money_flow_weights获取）
-                base_weights.update(money_flow_weights)
-                
-            elif use_fundamental:
-                # 仅基本面模式（原有权重）
-                base_weights = {
+            if use_fundamental:
+                self.factor_weights = {
                     'pe_ratio': -0.10, 'pb_ratio': -0.10, 'ps_ratio': -0.05,
                     'volatility_20d': -0.08, 'volatility_60d': -0.07,
                     'money_flow_20d': 0.08, 'volume_ratio': 0.07,
                     'return_20d': 0.08, 'return_60d': 0.07,
-                    'roe': 0.10, 'roa': 0.05,
-                    'gross_margin': 0.05, 'net_margin': 0.05,
-                    'debt_ratio': -0.05
+                    'roe': 0.10, 'roa': 0.05, 'gross_margin': 0.05, 'net_margin': 0.05, 'debt_ratio': -0.05
                 }
-                
-            elif use_money_flow:
-                # 技术 + 资金流模式
-                base_weights = {
-                    'pe_ratio': -0.10, 'pb_ratio': -0.10, 'ps_ratio': -0.08,
-                    'volatility_20d': -0.08, 'volatility_60d': -0.07,
-                    'money_flow_20d': 0.06, 'volume_ratio': 0.06,
-                    'return_20d': 0.08, 'return_60d': 0.07,
-                }
-                base_weights.update(money_flow_weights)
-                
             else:
-                # 仅技术因子模式（原有权重）
-                base_weights = {
+                self.factor_weights = {
                     'pe_ratio': -0.15, 'pb_ratio': -0.15, 'ps_ratio': -0.10,
                     'volatility_20d': -0.10, 'volatility_60d': -0.10,
                     'money_flow_20d': 0.10, 'volume_ratio': 0.10,
                     'return_20d': 0.10, 'return_60d': 0.10
                 }
-            
-            self.factor_weights = base_weights
 
-        print(f"\n📊 StockRanker 模型初始化")
-        print(f"   基本面: {'✓' if use_fundamental else '✗'}")
-        print(f"   资金流: {'✓' if use_money_flow else '✗'}")
-        if use_money_flow:
-            print(f"   资金流风格: {money_flow_style}")
-            print(f"   因子数量: {len(self.factor_weights)} 个")
+        print(f"\n📊 StockRanker 模型初始化 (基本面: {'启用' if use_fundamental else '禁用'})")
 
     def calculate_valuation_factors(self, df):
         df['pe_ratio'] = df['close'] / df.groupby('instrument')['close'].transform('mean')
@@ -676,24 +600,12 @@ class StockRankerModel:
     def calculate_all_factors(self, price_data):
         print("\n⚙️  计算StockRanker多因子...")
         df = price_data.copy()
-        
-        # 原有因子计算
         df = self.calculate_valuation_factors(df)
         df = self.calculate_volatility_factors(df)
         df = self.calculate_money_flow_factors(df)
         df = self.calculate_momentum_factors(df)
-        
         if self.use_fundamental:
             df = self.process_fundamental_factors(df)
-        
-        # ✅ 资金流因子计算（内存优化）
-        if self.use_money_flow:
-            print("\n💰 计算资金流因子...")
-            df = self.money_flow_calculator.calculate_simplified_money_flow(df)
-            
-            # 打印摘要（包含内存占用）
-            self.money_flow_calculator.print_factor_summary(df)
-        
         return df
 
     def normalize_factors(self, df):
@@ -704,40 +616,16 @@ class StockRankerModel:
 
     def calculate_position_score(self, df):
         print("\n📊 计算综合评分...")
-        
-        # ✅ 关键优化：避免一次性标准化所有因子
-        # 分批标准化，立即计算贡献
-        
-        df['position'] = 0.0
-        
+        df = self.normalize_factors(df)
+        df['position'] = 0
         for factor, weight in self.factor_weights.items():
-            if factor in df.columns:
-                # 直接标准化并累加，不保留 _norm 列
-                factor_rank = df.groupby('date')[factor].rank(pct=True).fillna(0.5)
-                df['position'] += factor_rank * weight
-                
-                # 立即删除临时变量
-                del factor_rank
-        
-        # 归一化到0-1
+            norm_factor = f'{factor}_norm'
+            if norm_factor in df.columns:
+                df['position'] += df[norm_factor].fillna(0.5) * weight
+
         min_score = df.groupby('date')['position'].transform('min')
         max_score = df.groupby('date')['position'].transform('max')
         df['position'] = (df['position'] - min_score) / (max_score - min_score + 1e-6)
-        
-        # 清理
-        del min_score, max_score
-        
-        # ✅ 新增：将一字涨停或涨停的股票分数置零
-        # 条件：最高价=最低价 (一字板) 或 收盘价=最高价 (可能的涨停)
-        # 注意：这可能会误杀一些强势股，但在回测中“宁可错杀不可买入”
-        if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
-            limit_up_mask = (df['high'] == df['low']) | (df['close'] == df['high'])
-            
-            # 将这些股票的分数设为 0，确保不会被选中
-            df.loc[limit_up_mask, 'position'] = 0
-            
-            print(f"  ⚠️ 已剔除 {limit_up_mask.sum()} 条疑似涨停数据")
-        
         print("✓ 评分计算完成")
         return df
 
@@ -781,31 +669,22 @@ def calculate_simple_factors(price_data):
 
 # ========== 第5部分：主数据加载函数 ==========
 
-def load_data_from_tushare(
-    start_date, end_date, max_stocks=50, use_cache=True,
-    cache_manager=None, use_stockranker=True,
-    custom_weights=None, tushare_token=None,
-    use_fundamental=True, min_days_listed=180,
-    use_money_flow=True, money_flow_style='balanced'  # ✅ 新增参数
-):
+def load_data_from_tushare(start_date, end_date, max_stocks=50, use_cache=True,
+                           cache_manager=None, use_stockranker=True,
+                           custom_weights=None, tushare_token=None,
+                           use_fundamental=True, min_days_listed=180):
     """
-    从Tushare加载数据并计算因子 (内存优化版 v2.6)
-    
-    新增参数:
-        use_money_flow: 是否启用资金流因子
-        money_flow_style: 'conservative' | 'balanced' | 'aggressive'
+    从Tushare加载数据并计算因子 (完整优化版 v2.5)
     """
-    
     print("\n" + "=" * 80)
-    print("📦 数据加载模块 (内存优化版 v2.6)")
+    print("📦 数据加载模块 (完整优化版 v2.5)")
     print("=" * 80)
 
     # 生成缓存Key
     model_suffix = "stockranker" if use_stockranker else "simple"
     if use_fundamental: model_suffix += "_fundamental"
-    if use_money_flow: model_suffix += "_moneyflow"  # ✅ 添加资金流标识
-    cache_key = f"factor_data_ts_v2.6_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
-    price_cache_key = f"price_data_ts_v2.6_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
+    cache_key = f"factor_data_ts_v2.5_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
+    price_cache_key = f"price_data_ts_v2.5_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
 
     # 1. 尝试从缓存加载
     if use_cache and cache_manager:
@@ -868,12 +747,7 @@ def load_data_from_tushare(
 
     # 6. 计算因子
     if use_stockranker:
-        model = StockRankerModel(
-            custom_weights=custom_weights,
-            use_fundamental=use_fundamental,
-            use_money_flow=use_money_flow,        # ✅ 传入参数
-            money_flow_style=money_flow_style     # ✅ 传入参数
-        )
+        model = StockRankerModel(custom_weights=custom_weights, use_fundamental=use_fundamental)
         factor_df = model.calculate_all_factors(price_df)
         factor_df = model.calculate_position_score(factor_df)
     else:

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ml_factor_scoring_fixed.py - 修复数据泄露后的高级机器学习因子评分系统
+ml_factor_scoring_complete.py - 完整的高级机器学习因子评分系统
 
-🔧 主要修复内容：
-1. ✅ 严格隔离预测列（position, ml_score等）防止泄露
-2. ✅ 移除共线性因子（pb/ps只保留pe）
-3. ✅ 添加特征验证断言
-4. ✅ 优化特征排除逻辑
-5. ✅ 修复XGBoost 2.0+兼容性问题
+整合内容：
+1. 核心基础模块 (IC计算, 时间序列切分)
+2. 因子处理模块 (StockRanker, 因子生成)
+3. 高级ML评分器 (Walk-Forward训练, XGBoost/LightGBM集成)
+4. 行业与回测模块 (行业中性化, 选股, 简单回测)
+5. 策略编排与示例 (MultiFactorMLStrategy)
 
 核心优化特性：
 ✅ 1. 时间序列切分（避免前视偏差）
@@ -192,32 +192,26 @@ class ICCalculator:
     def get_ic_weights(self, ic_results: Dict, period: int = 5, method: str = 'icir') -> Dict[str, float]:
         """根据IC计算因子权重"""
         weights = {}
-        total_score = 0.0
+        total_score = 0
 
         for factor, periods in ic_results.items():
             if period not in periods:
-                weights[factor] = 0.0
+                weights[factor] = 0
                 continue
 
-            period_data = periods[period]
-            ic_val = period_data.get('ic', 0.0) or 0.0
-            rank_ic_val = period_data.get('rank_ic', 0.0) or 0.0
-            icir_val = period_data.get('icir', 0.0) or 0.0
-            rank_icir_val = period_data.get('rank_icir', 0.0) or 0.0
-
             val_map = {
-                'ic': abs(float(ic_val)),
-                'rank_ic': abs(float(rank_ic_val)),
-                'icir': abs(float(icir_val)),
-                'rank_icir': abs(float(rank_icir_val))
+                'ic': abs(periods[period].get('ic', 0)),
+                'rank_ic': abs(periods[period].get('rank_ic', 0)),
+                'icir': abs(periods[period].get('icir', 0)),
+                'rank_icir': abs(periods[period].get('rank_icir', 0))
             }
-            score = val_map.get(method, abs(float(ic_val)))
+            score = val_map.get(method, abs(periods[period].get('ic', 0)))
 
-            weights[factor] = float(score)
-            total_score += float(score)
+            weights[factor] = score
+            total_score += score
 
         if total_score > 0:
-            weights = {k: float(v / total_score) for k, v in weights.items()}
+            weights = {k: v / total_score for k, v in weights.items()}
 
         return weights
 
@@ -448,18 +442,13 @@ class FactorGenerator:
 
 
 # ============================================================================
-# 第三部分：高级ML评分器 (完整实现 - 已修复数据泄露)
+# 第三部分：高级ML评分器 (完整实现)
 # ============================================================================
 
 class AdvancedMLScorer:
     """
-    高级机器学习评分器 (修复版)
+    高级机器学习评分器
     整合: 时间序列切分, IC特征, Active Return标签, 模型集成
-
-    🔧 修复内容:
-    1. 严格排除所有预测相关列（position, ml_score等）
-    2. 添加特征验证断言
-    3. 预测结果独立存储，不污染训练数据
     """
 
     def __init__(self, model_type: str = 'xgboost', target_period: int = 5, top_percentile: float = 0.20,
@@ -483,9 +472,6 @@ class AdvancedMLScorer:
 
     def prepare_training_data(self, factor_data: pd.DataFrame, price_data: pd.DataFrame,
                               factor_columns: List[str]) -> Tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
-        """
-        🔧 修复：严格排除预测列，防止数据泄露
-        """
         print(f"\n📦 准备训练数据...")
         price_col = self._detect_price_column(price_data)
 
@@ -506,12 +492,8 @@ class AdvancedMLScorer:
 
         # 构建目标变量
         print(f"  ✓ 构建目标变量 (Active Return: {self.use_active_return})...")
-        # 修复收益率计算方向 - 使用未来价格与当前价格的比值来计算收益率
-        # 🔧 修复：使用向量化操作替代groupby.apply避免索引不匹配问题
-        merged = merged.sort_values(['instrument', 'date']).reset_index(drop=True)
-        future_prices = merged.groupby('instrument')[price_col].shift(-self.target_period)
-        current_prices = merged[price_col]
-        merged['abs_return'] = (future_prices / current_prices) - 1
+        merged['abs_return'] = merged.groupby('instrument')[price_col].pct_change(self.target_period).shift(
+            -self.target_period)
 
         if self.use_active_return:
             market_return = merged.groupby('date')['abs_return'].transform('mean')
@@ -533,51 +515,15 @@ class AdvancedMLScorer:
 
         merged = merged.dropna(subset=[target_col])
 
-        # 🔥 修复：严格排除所有可能泄露的列
-        exclude = [
-            # 基础标识列
-            'date', 'instrument',
-            # 目标变量相关
-            'future_return', 'abs_return', 'target',
-            # 价格列
-            price_col, 'close', 'Close', 'price', 'Price', 'adj_close',
-            # 分类列
-            'industry', 'sector', 'market_cap', 'log_cap',
-            # 🔥 关键：所有预测/评分相关列（防止数据泄露）
-            'ml_score', 'position', 'score_rank',
-            'composite_score', 'composite_score_neutral',
-            'score_rank_neutral', 'industry_rank',
-            # 中间处理列
-            'year_month'
-        ]
-
-        # 特征选择：排除非数值列和处理过的列
-        feature_cols = [c for c in merged.columns
-                        if c not in exclude
-                        and pd.api.types.is_numeric_dtype(merged[c])
-                        and not c.endswith('_processed')]  # 排除中间处理列
-
-        # 🔥 修复：添加断言验证，防止position等列泄露
-        leaked_cols = [c for c in ['position', 'ml_score', 'score_rank', 'composite_score']
-                       if c in feature_cols]
-        if leaked_cols:
-            raise ValueError(f"⚠️ CRITICAL: 检测到数据泄露！以下列不应作为特征: {leaked_cols}")
-
-        print(f"  ✓ 验证通过：已排除 {len(exclude)} 类列，保留 {len(feature_cols)} 个有效特征")
+        # 特征选择
+        exclude = ['date', 'instrument', 'future_return', 'abs_return', 'target', price_col,
+                   'industry', 'ml_score', 'position', 'composite_score']
+        feature_cols = [c for c in merged.columns if c not in exclude and pd.api.types.is_numeric_dtype(merged[c])]
 
         X = merged[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
         y = merged[target_col].values
         self.feature_names = feature_cols
 
-        # 打印前10个特征用于验证
-        print(f"  📋 特征示例: {feature_cols[:10]}")
-
-        # 确保返回的是DataFrame而不是Series
-        if isinstance(X, pd.Series):
-            X = X.to_frame()
-        # 确保y是numpy数组
-        if not isinstance(y, np.ndarray):
-            y = np.array(y)
         return X, y, merged
 
     def train_walk_forward(self, X: pd.DataFrame, y: np.ndarray, merged: pd.DataFrame, n_splits: int = 3):
@@ -606,80 +552,13 @@ class AdvancedMLScorer:
 
             # 评估
             if model is not None:
-                try:
-                    if self.use_classification:
-                        # 对于分类模型，使用AUC作为评估指标
-                        try:
-                            # 检查模型类型，避免在回归模型上调用predict_proba
-                            model_name = type(model).__name__
-                            if 'Regressor' in model_name:
-                                # 如果是回归模型，使用predict方法
-                                pred = model.predict(X_valid_s)
-                                # 安全地转换为numpy数组
-                                if str(type(pred)).find('sparse') >= 0 or hasattr(pred, 'toarray'):
-                                    try:
-                                        pred = pred.toarray()  # type: ignore
-                                    except:
-                                        pass
-                                pred = np.asarray(pred).flatten()
-                                valid_score = roc_auc_score(y_valid, pred)
-                            elif hasattr(model, 'predict_proba') and 'Classifier' in model_name:
-                                proba = model.predict_proba(X_valid_s)
-                                # 安全地转换为numpy数组
-                                if str(type(proba)).find('sparse') >= 0 or hasattr(proba, 'toarray'):
-                                    try:
-                                        proba = proba.toarray()  # type: ignore
-                                    except:
-                                        pass
-                                proba = np.asarray(proba)
-                                if len(proba.shape) > 1 and proba.shape[1] > 1:
-                                    valid_score = roc_auc_score(y_valid, proba[:, 1])
-                                else:
-                                    valid_score = roc_auc_score(y_valid, proba[:, 0] if len(proba.shape) > 1 else proba)
-                            else:
-                                # 如果没有predict_proba方法，使用predict方法
-                                pred = model.predict(X_valid_s)
-                                # 安全地转换为numpy数组
-                                if str(type(pred)).find('sparse') >= 0 or hasattr(pred, 'toarray'):
-                                    try:
-                                        pred = pred.toarray()  # type: ignore
-                                    except:
-                                        pass
-                                pred = np.asarray(pred).flatten()
-                                valid_score = roc_auc_score(y_valid, pred)
-                            print(f"     验证AUC: {valid_score:.4f}")
-                        except Exception as e:
-                            print(f"     AUC计算出错: {e}")
-                            valid_score = 0.0
-                    else:
-                        # 对于回归模型，使用IC作为评估指标
-                        try:
-                            pred = model.predict(X_valid_s)
-                            # 安全地转换为numpy数组
-                            if str(type(pred)).find('sparse') >= 0 or hasattr(pred, 'toarray'):
-                                try:
-                                    pred = pred.toarray()  # type: ignore
-                                except:
-                                    pass
-                            pred = np.asarray(pred)
-                            # 确保输入是1维数组
-                            if len(pred.shape) > 1:
-                                pred = pred.flatten()
-                            # 确保y_valid是numpy数组
-                            y_valid_flat = np.asarray(y_valid)
-                            if len(y_valid_flat.shape) > 1:
-                                y_valid_flat = y_valid_flat.flatten()
-                            # 计算相关系数
-                            correlation_matrix = np.corrcoef(y_valid_flat, pred)
-                            valid_score = correlation_matrix[0, 1] if correlation_matrix.size > 1 else 0
-                            print(f"     验证IC: {valid_score:.4f}")
-                        except Exception as e:
-                            print(f"     IC计算出错: {e}")
-                            valid_score = 0.0
-                    window_results.append({'model': model, 'score': float(valid_score), 'window': i})
-                except Exception as e:
-                    print(f"     评估出错: {e}")
-                    window_results.append({'model': model, 'score': 0.0, 'window': i})
+                if self.use_classification:
+                    valid_score = roc_auc_score(y_valid, model.predict_proba(X_valid_s)[:, 1])
+                    print(f"     验证AUC: {valid_score:.4f}")
+                else:
+                    valid_score = np.corrcoef(y_valid, model.predict(X_valid_s))[0, 1]
+                    print(f"     验证IC: {valid_score:.4f}")
+                window_results.append({'model': model, 'score': valid_score, 'window': i})
 
         # 选择最佳模型
         if window_results:
@@ -689,9 +568,9 @@ class AdvancedMLScorer:
         return self
 
     def _train_model(self, X_train, y_train, X_valid, y_valid):
-        """🔧 修复：XGBoost 2.0+ 兼容性"""
+        """通用模型训练入口 (修复 XGBoost 2.0+ 兼容性)"""
         if self.use_classification:
-            if self.model_type == 'xgboost' and XGBOOST_AVAILABLE and xgb is not None:
+            if self.model_type == 'xgboost' and XGBOOST_AVAILABLE:
                 # 修复：early_stopping_rounds 移入构造函数
                 model = xgb.XGBClassifier(
                     n_estimators=300, learning_rate=0.05, max_depth=6,
@@ -700,7 +579,7 @@ class AdvancedMLScorer:
                 )
                 model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
                 return model
-            elif LIGHTGBM_AVAILABLE and lgb is not None:
+            elif LIGHTGBM_AVAILABLE:
                 model = lgb.LGBMClassifier(
                     n_estimators=300, learning_rate=0.05, max_depth=6,
                     metric='auc', random_state=self.random_state, n_jobs=-1, verbose=-1
@@ -710,7 +589,8 @@ class AdvancedMLScorer:
                 return model
         else:
             # 回归逻辑
-            if self.model_type == 'xgboost' and XGBOOST_AVAILABLE and xgb is not None:
+            if self.model_type == 'xgboost' and XGBOOST_AVAILABLE:
+                # 修复：early_stopping_rounds 移入构造函数
                 model = xgb.XGBRegressor(
                     n_estimators=300, max_depth=6, random_state=self.random_state, n_jobs=-1,
                     early_stopping_rounds=30
@@ -728,42 +608,18 @@ class AdvancedMLScorer:
         return self
 
     def predict_scores(self, factor_data: pd.DataFrame) -> pd.DataFrame:
-        """
-        🔧 修复：预测结果独立存储，不污染原始特征
-        """
-        if 'best' not in self.models:
-            raise ValueError("模型未训练")
-
+        if 'best' not in self.models: raise ValueError("模型未训练")
         data = factor_data.copy()
-
-        # 只提取特征列进行预测
         X = data[self.feature_names].replace([np.inf, -np.inf], np.nan).fillna(0)
         X_scaled = self.scaler.transform(X)
 
         model = self.models['best']
+        if self.use_classification:
+            data['ml_score'] = model.predict_proba(X_scaled)[:, 1]
+        else:
+            data['ml_score'] = model.predict(X_scaled)
 
-        # 🔥 修复：创建独立的结果DataFrame
-        predictions = model.predict_proba(X_scaled)[:, 1] if self.use_classification else model.predict(X_scaled)
-
-        result = pd.DataFrame({
-            'date': data['date'].values,
-            'instrument': data['instrument'].values,
-            'ml_score': predictions
-        })
-
-        # 计算排名（在独立DataFrame中）
-        result['position'] = result.groupby('date')['ml_score'].rank(pct=True)
-
-        # 🔥 关键：只合并必要的预测列，保持原始数据清洁
-        # 如果原数据已有这些列，先删除
-        for col in ['ml_score', 'position']:
-            if col in data.columns:
-                data = data.drop(columns=[col])
-
-        # 合并预测结果
-        data = data.merge(result, on=['date', 'instrument'], how='left')
-
-        print(f"  ✓ 预测完成，生成 ml_score 和 position 列")
+        data['position'] = data.groupby('date')['ml_score'].rank(pct=True)
         return data
 
     def get_feature_importance(self, top_n: int = 20):
@@ -776,21 +632,6 @@ class AdvancedMLScorer:
         for col in ['close', 'Close', 'price', 'Price']:
             if col in df.columns: return col
         return None
-
-    def _safe_to_numpy_array(self, data):
-        """安全地将数据转换为numpy数组"""
-        try:
-            # 检查是否为稀疏矩阵
-            if str(type(data)).find('sparse') >= 0:
-                if hasattr(data, 'toarray'):
-                    try:
-                        data = data.toarray()
-                    except:
-                        pass
-            # 转换为numpy数组
-            return np.asarray(data)
-        except:
-            return np.asarray(data)
 
 
 # ============================================================================
@@ -809,10 +650,9 @@ def get_industry_data(instruments: List[str], tushare_token: Optional[str] = Non
         pro = ts.pro_api()
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
         df = df[df['ts_code'].isin(instruments)]
-        df = df.rename(columns={'ts_code': 'instrument'})  # type: ignore
+        df = df.rename(columns={'ts_code': 'instrument'})
         df['industry'] = df['industry'].fillna('其他')
-        result = df[['instrument', 'industry']]
-        return result if isinstance(result, pd.DataFrame) else pd.DataFrame()  # type: ignore
+        return df[['instrument', 'industry']]
     except Exception as e:
         print(f"  ⚠️  获取行业失败: {e}")
         return pd.DataFrame({'instrument': instruments, 'industry': '其他'})
@@ -861,7 +701,7 @@ class EnhancedStockSelector:
         results = []
         for date in data['date'].unique():
             daily = data[(data['date'] == date) & (data['position'] >= min_score)].sort_values('position',
-                                                                                               ascending=False)  # type: ignore
+                                                                                               ascending=False)
 
             if max_stocks and len(daily) > max_stocks:
                 limit = int(max_stocks * max_industry_conc)
@@ -892,12 +732,7 @@ class SimpleBacktester:
         merged = selected_stocks.merge(price_data[['instrument', 'date', price_col]], on=['instrument', 'date'],
                                        how='left')
         merged = merged.sort_values(['instrument', 'date'])
-        # 修复收益率计算方向 - 使用未来价格与当前价格的比值来计算收益率
-        # 修复索引不匹配问题
-        merged = merged.sort_values(['instrument', 'date']).reset_index(drop=True)
-        future_prices = merged.groupby('instrument')[price_col].shift(-holding_period)
-        current_prices = merged[price_col]
-        merged['ret'] = (future_prices / current_prices) - 1
+        merged['ret'] = merged.groupby('instrument')[price_col].pct_change(holding_period).shift(-holding_period)
 
         valid = merged.dropna(subset=['ret'])
         if len(valid) == 0: return {}
@@ -921,53 +756,20 @@ class SimpleBacktester:
 
 class MultiFactorMLStrategy:
     """
-    多因子ML选股策略编排器 (修复版)
-    流程: 因子清洗 -> IC分析 -> StockRanker -> Walk-Forward ML -> 行业评分 -> 选股 -> 回测
-
-    🔧 修复内容:
-    1. 自动剔除共线性因子（pb/ps）
-    2. 可选剔除无效基本面因子
-    3. 训练前清理污染列
+    多因子ML选股策略编排器
+    流程: 因子IC -> StockRanker -> Walk-Forward ML -> 行业评分 -> 选股 -> 回测
     """
 
-    def __init__(self, model_type='xgboost', target_period=5, train_months=12,
-                 tushare_token=None, remove_collinear=True, remove_weak_factors=False):
+    def __init__(self, model_type='xgboost', target_period=5, train_months=12, tushare_token=None):
         self.target_period = target_period
-        self.remove_collinear = remove_collinear
-        self.remove_weak_factors = remove_weak_factors
-
         self.ic_calc = ICCalculator([target_period])
         self.ranker = StockRanker(method='ic_weight')
         self.ml = AdvancedMLScorer(model_type=model_type, target_period=target_period, train_months=train_months)
         self.ind_scorer = IndustryBasedScorer(tushare_token)
         self.selector = EnhancedStockSelector()
 
-    def _clean_factors(self, factor_cols: List[str]) -> List[str]:
-        """🔧 修复：因子清洗"""
-        cleaned = factor_cols.copy()
-
-        # 移除共线性因子
-        if self.remove_collinear:
-            collinear = ['pb_ratio', 'ps_ratio']  # 只保留pe_ratio
-            cleaned = [f for f in cleaned if f not in collinear]
-            if any(c in factor_cols for c in collinear):
-                print(f"  ✂️  移除共线性因子: {[c for c in collinear if c in factor_cols]}")
-
-        # 移除弱因子
-        if self.remove_weak_factors:
-            weak = ['roe', 'roa', 'net_profit_margin', 'gross_profit_margin']
-            cleaned = [f for f in cleaned if f not in weak]
-            if any(w in factor_cols for w in weak):
-                print(f"  ✂️  移除弱因子: {[w for w in weak if w in factor_cols]}")
-
-        print(f"  ✓ 因子清洗完成: {len(factor_cols)} -> {len(cleaned)}")
-        return cleaned
-
     def run(self, factor_data, price_data, factor_cols, min_score=0.7, max_stocks=30):
-        print("=" * 60 + "\n  多因子ML策略启动 (修复版)\n" + "=" * 60)
-
-        # 🔧 修复：因子清洗
-        factor_cols = self._clean_factors(factor_cols)
+        print("=" * 60 + "\n  多因子ML策略启动\n" + "=" * 60)
 
         # 1. IC分析 & 权重
         ic_res = self.ic_calc.calculate_factor_ic(factor_data, price_data, factor_cols)
@@ -977,12 +779,8 @@ class MultiFactorMLStrategy:
         processed = self.ranker.preprocess_factors(factor_data, factor_cols)
         scored = self.ranker.calculate_composite_score(processed, factor_cols, weights)
 
-        # 🔧 修复：训练前清理污染列
-        clean_cols = ['ml_score', 'position', 'score_rank', 'composite_score']
-        clean_data = scored.drop(columns=[c for c in clean_cols if c in scored.columns], errors='ignore')
-
         # 3. ML增强
-        X, y, merged = self.ml.prepare_training_data(clean_data, price_data, factor_cols)
+        X, y, merged = self.ml.prepare_training_data(scored, price_data, factor_cols)
         self.ml.train_walk_forward(X, y, merged)
         ml_scored = self.ml.predict_scores(merged)
 
@@ -997,15 +795,11 @@ class MultiFactorMLStrategy:
         # 特征重要性
         imp = self.ml.get_feature_importance()
         if imp is not None:
-            print("\n  🔑 Top 10 重要特征:")
-            print(imp.head(10).to_string(index=False))
+            print("\n  🔑 Top 5 重要特征:")
+            print(imp.head(5))
 
         return {'picks': picks, 'backtest': backtest, 'feature_importance': imp}
 
-
-# ============================================================================
-# 第六部分：测试数据生成与验证
-# ============================================================================
 
 def generate_sample_data(n_stocks=50, n_days=200):
     """生成测试数据"""
@@ -1019,71 +813,19 @@ def generate_sample_data(n_stocks=50, n_days=200):
     for date in dates:
         for inst in instruments:
             rec = {'date': date, 'instrument': inst}
-            # 生成各类因子
-            for i in range(5):
-                rec[f'factor_{i}'] = np.random.randn()
-            # 添加估值因子（模拟）
-            rec['pe_ratio'] = np.random.uniform(5, 50)
-            # 添加动量因子
-            rec['momentum_20d'] = np.random.randn() * 0.1
+            for i in range(5): rec[f'factor_{i}'] = np.random.randn()
             records.append(rec)
-
-            # 价格数据
-            prices.append({
-                'date': date,
-                'instrument': inst,
-                'close': 100 * (1 + np.random.randn() * 0.02)
-            })
+            prices.append({'date': date, 'instrument': inst, 'close': 100 * (1 + np.random.randn() * 0.1)})
 
     return pd.DataFrame(records), pd.DataFrame(prices)
 
 
-def validate_no_leakage(strategy_results: Dict):
-    """验证是否存在数据泄露"""
-    print("\n🔍 数据泄露验证...")
-    imp = strategy_results.get('feature_importance')
-
-    if imp is not None:
-        leaked = imp[imp['feature'].str.contains('position|ml_score|score_rank', case=False, na=False)]
-        if len(leaked) > 0:
-            print(f"  ⚠️  警告：检测到可疑特征: {leaked['feature'].tolist()}")
-            return False
-        else:
-            print(f"  ✅ 验证通过：未检测到泄露列")
-            return True
-    return None
-
-
 if __name__ == '__main__':
-    print("\n" + "=" * 60)
-    print("  机器学习因子评分系统 - 修复版演示")
-    print("=" * 60)
+    # 示例运行
+    factors, prices = generate_sample_data()
+    cols = [f'factor_{i}' for i in range(5)]
 
-    # 生成测试数据
-    factors, prices = generate_sample_data(n_stocks=50, n_days=200)
+    strategy = MultiFactorMLStrategy(model_type='xgboost', train_months=3)
+    results = strategy.run(factors, prices, cols)
 
-    # 因子列表
-    cols = [f'factor_{i}' for i in range(5)] + ['pe_ratio', 'momentum_20d']
-
-    # 运行策略（启用因子清洗）
-    strategy = MultiFactorMLStrategy(
-        model_type='xgboost',
-        train_months=3,
-        remove_collinear=True,  # 移除共线性因子
-        remove_weak_factors=False  # 保留基本面因子（测试用）
-    )
-
-    results = strategy.run(factors, prices, cols, min_score=0.6, max_stocks=20)
-
-    # 验证
-    validate_no_leakage(results)
-
-    print("\n" + "=" * 60)
-    print("  ✅ 演示完成")
-    print("=" * 60)
-    print("\n💡 关键修复点:")
-    print("  1. prepare_training_data() 严格排除预测列")
-    print("  2. predict_scores() 独立存储结果，不污染训练数据")
-    print("  3. 添加断言验证，防止position等列泄露")
-    print("  4. 自动清洗共线性和弱因子")
-    print("  5. XGBoost 2.0+ 兼容性修复")
+    print("\n✅ 演示完成")

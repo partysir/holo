@@ -258,25 +258,25 @@ def main():
     ml_start = time.time()
 
     try:
-        from ml_factor_scoring_integrated import UltraMLScorer
-        import pandas as pd
+        from ml_factor_scoring_fixed import MLFactorScorer, IndustryBasedScorer, EnhancedStockSelector
 
         # ML评分
-        ml_scorer = UltraMLScorer(
-            target_period=5,
-            top_percentile=0.20,
-            embargo_days=5,
-            neutralize_market=True,
-            neutralize_industry=True,
-            voting_strategy='average',
-            train_months=12
+        ml_scorer = MLFactorScorer(model_type='xgboost')
+        factor_data = ml_scorer.predict_scores(factor_data, price_data)
+
+        # 分行业评分
+        if factor_columns:
+            industry_scorer = IndustryBasedScorer()
+            factor_data = industry_scorer.score_by_industry(factor_data, factor_columns)
+
+        # 增强选股
+        selector = EnhancedStockSelector()
+        factor_data = selector.select_stocks(
+            factor_data,
+            min_score=0.6,
+            max_concentration=0.15,
+            max_industry_concentration=0.3
         )
-        # 训练模型
-        factor_columns = [col for col in factor_data.columns if col not in ['date', 'instrument', 'industry'] and pd.api.types.is_numeric_dtype(factor_data[col])]
-        X, y, merged = ml_scorer.prepare_data(factor_data, price_data, factor_columns)
-        ml_scorer.train(X, y, merged)
-        # 预测
-        factor_data = ml_scorer.predict(factor_data, price_data)
 
         print("  ✓ ML评分完成")
 

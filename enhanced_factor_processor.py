@@ -236,9 +236,12 @@ class EnhancedFactorProcessor:
             print("      ⚠️  缺少价格数据，无法计算因子有效性指标")
             return metrics
         
-        # 计算未来收益
+        # 计算未来收益 - 修复收益率计算方向
         factor_data = factor_data.sort_values(['instrument', 'date'])
-        factor_data['future_return'] = factor_data.groupby('instrument')['close'].pct_change(forward_period).shift(-forward_period)
+        # 修正：使用正确的未来收益计算方式
+        factor_data['future_return'] = factor_data.groupby('instrument')['close'].apply(
+            lambda x: (x.shift(-forward_period) / x) - 1
+        )
         
         for col in factor_columns:
             if col not in factor_data.columns:

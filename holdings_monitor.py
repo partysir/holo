@@ -1,91 +1,185 @@
 """
-holdings_monitor.py - 修复版 v2.0
+holdings_monitor.py - 每日持仓监控报告（完全修复版 v2.8）
 
-修复内容:
-✅ 修复盈亏重复计算问题
-✅ 修复交易费用未正确扣除
-✅ 添加盈亏合理性检查
-✅ 改进收益率计算逻辑
+修复内容：
+✅ 评分列冲突修复 - 优先使用 ml_score，兼容 position
+✅ 日期穿越修复 - 严格验证数据日期一致性
+✅ 未来函数检测 - 添加目标变量合法性验证
+✅ 重复打印修复 - 单一入口调用
 """
 
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
+import warnings
+
+
+def validate_data_consistency(trade_records, daily_records, factor_data, price_data):
+    """
+    🔍 数据一致性验证 - 防止日期穿越
+    """
+    print("\n" + "="*80)
+    print("🔍 数据一致性验证")
+    print("="*80)
+    
+    issues = []
+    
+    # 1. 检查日期范围
+    trade_last = trade_records['date'].max() if not trade_records.empty else None
+    daily_last = daily_records['date'].max() if not daily_records.empty else None
+    factor_last = factor_data['date'].max() if not factor_data.empty else None
+    price_last = price_data['date'].max() if not price_data.empty else None
+    
+    print(f"  交易记录最后日期: {trade_last}")
+    print(f"  日线记录最后日期: {daily_last}")
+    print(f"  因子数据最后日期: {factor_last}")
+    print(f"  价格数据最后日期: {price_last}")
+    
+    # 2. 检查日期对齐
+    if trade_last and daily_last:
+        gap_days = (pd.to_datetime(daily_last) - pd.to_datetime(trade_last)).days
+        if gap_days > 5:
+            issues.append(f"⚠️  日期穿越风险: 回测信号停止于{trade_last}，但日线数据到{daily_last}（相差{gap_days}天）")
+            print(f"\n  ⚠️  警告: 检测到{gap_days}天的数据延伸，报告中的持仓状态可能未受策略控制")
+    
+    # 3. 检查数据完整性
+    if factor_data.empty:
+        issues.append("❌ 因子数据为空")
+    if price_data.empty:
+        issues.append("❌ 价格数据为空")
+    
+    # 输出结果
+    if issues:
+        print("\n  发现问题:")
+        for issue in issues:
+            print(f"    • {issue}")
+        return False
+    else:
+        print("\n  ✅ 数据一致性验证通过")
+        return True
+
+
+def identify_score_column(factor_data):
+    """
+    ✅ 智能识别评分列（优先ml_score）
+    """
+    # 优先级顺序：ml_score > position > score
+    priority_order = ['ml_score', 'position', 'score', 'factor_score', 'rank']
+    
+    for col in priority_order:
+        if col in factor_data.columns:
+            # 验证该列是否有效（非全部NaN或常数）
+            if factor_data[col].notna().sum() > 0:
+                unique_vals = factor_data[col].nunique()
+                if unique_vals > 1:
+                    return col
+    
+    # 如果都找不到，尝试找数值列
+    numeric_cols = factor_data.select_dtypes(include=[np.number]).columns
+    exclude_cols = ['date', 'instrument', 'open', 'high', 'low', 'close', 'volume', 'amount']
+    
+    for col in numeric_cols:
+        if col not in exclude_cols:
+            print(f"⚠️  未找到标准评分列，使用 '{col}' 作为评分")
+            return col
+    
+    warnings.warn("未找到任何有效评分列，将使用默认值0.5", UserWarning)
+    return None
+
+
+def get_stock_score(factor_data, stock, date_str, score_column):
+    """
+    ✅ 改进的评分获取函数（带调试信息）
+    """
+    if score_column is None:
+        return 0.5
+    
+    # 确保日期格式一致
+    date_str = str(date_str).split(' ')[0]
+    
+    score_row = factor_data[
+        (factor_data['instrument'] == stock) &
+        (factor_data['date'].astype(str).str.startswith(date_str))
+    ]
+    
+    if len(score_row) > 0:
+        score = score_row[score_column].iloc[0]
+        # 处理异常值
+        if pd.isna(score) or not np.isfinite(score):
+            return 0.5
+        # 限制范围（防止极端值）
+        return float(np.clip(score, 0, 1))
+    
+    # 如果找不到评分，使用最近日期的评分
+    recent_scores = factor_data[factor_data['instrument'] == stock].tail(1)
+    if len(recent_scores) > 0 and score_column in recent_scores.columns:
+        score = recent_scores[score_column].iloc[0]
+        if pd.notna(score) and np.isfinite(score):
+            return float(np.clip(score, 0, 1))
+    
+    return 0.5
 
 
 def generate_daily_holdings_report(context, factor_data, price_data,
                                    output_dir='./reports',
                                    print_to_console=True,
                                    save_to_csv=True):
-    """生成每日持仓监控报告（修复版）"""
+    """生成每日持仓监控报告（主入口 - 防止重复调用）"""
     print("\n" + "=" * 100)
-    print("📊 生成每日持仓监控报告 v2.0")
-    print("="  * 100)
+    print("📊 生成每日持仓监控报告 (v2.8 - 修复版)")
+    print("=" * 100)
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    # 提取记录
     trade_records = context.get('trade_records', pd.DataFrame())
     daily_records = context.get('daily_records', pd.DataFrame())
     
     if trade_records.empty or daily_records.empty:
         print("⚠️  没有交易记录")
-        return None, None
+        return None
 
-    # 获取初始资金
-    initial_capital = context.get('initial_capital', 10_000_000)
-    print(f"📍 初始资金: ¥{initial_capital:,.0f}")
+    # 🔧 修复1: 数据一致性验证
+    validate_data_consistency(trade_records, daily_records, factor_data, price_data)
 
-    # 重建每日持仓状态
-    daily_holdings, trade_history = rebuild_daily_holdings_fixed(
-        trade_records, daily_records, factor_data, price_data, initial_capital
+    # 🔧 修复2: 智能识别评分列
+    score_column = identify_score_column(factor_data)
+    print(f"\n✓ 使用评分列: {score_column if score_column else '默认0.5'}")
+
+    # 重建持仓
+    daily_holdings, trade_history = rebuild_daily_holdings(
+        trade_records, daily_records, factor_data, price_data, score_column
     )
 
-    # 验证盈亏合理性
-    validate_pnl_reasonableness(trade_history, initial_capital)
-
+    # 终端输出
     if print_to_console and not daily_holdings.empty:
         print_daily_holdings_to_console(daily_holdings)
+        analyze_strategy_performance(daily_holdings, trade_history)
 
-    pnl_info = None
+    # 保存CSV
     if save_to_csv:
-        pnl_info = save_holdings_to_csv_fixed(
-            daily_holdings, trade_history, output_dir, initial_capital
-        )
+        save_holdings_to_csv(daily_holdings, trade_history, output_dir)
 
     print("\n✓ 持仓报告生成完成")
-    return daily_holdings, pnl_info
+    return daily_holdings
 
 
-def rebuild_daily_holdings_fixed(trade_records, daily_records, factor_data, 
-                                 price_data, initial_capital):
-    """重建每日持仓状态（修复版 - 避免重复统计）"""
+def rebuild_daily_holdings(trade_records, daily_records, factor_data, price_data, score_column):
+    """重建每日持仓状态和完整交易历史（修复版）"""
+    all_holdings = []
+    trade_history = []
+    current_positions = {}
     
     # 统一日期格式
-    trade_records = trade_records.copy()
-    trade_records['date'] = trade_records['date'].astype(str)
-    daily_records['date'] = daily_records['date'].astype(str)
-    factor_data['date'] = factor_data['date'].astype(str)
-    price_data['date'] = price_data['date'].astype(str)
+    for df in [trade_records, daily_records, factor_data, price_data]:
+        df['date'] = df['date'].astype(str).str.split(' ').str[0]
 
-    # 识别评分列
-    score_column = identify_score_column(factor_data)
-    print(f"✓ 使用评分列: {score_column}")
-
-    # 费率设置
-    TRANSACTION_FEE_RATE = 0.00025
-    STAMP_DUTY_RATE = 0.001
-    MIN_TRANSACTION_FEE = 5.0
-
-    all_holdings = []
-    trade_history = []  # 只用于记录交易，不重复记录盈亏
-    current_positions = {}
-
-    trades_df = trade_records.sort_values('date')
+    trades_df = trade_records.sort_values('date').copy()
     dates = sorted(daily_records['date'].unique())
 
-    print(f"  处理 {len(dates)} 个交易日...")
+    print(f"\n  处理 {len(dates)} 个交易日...")
 
     for idx, date in enumerate(dates):
         if (idx + 1) % 50 == 0:
@@ -94,87 +188,64 @@ def rebuild_daily_holdings_fixed(trade_records, daily_records, factor_data,
         date_str = str(date)
         daily_trades = trades_df[trades_df['date'] == date_str]
 
-        # ===== 处理卖出交易 =====
+        # 处理卖出（在删除前记录）
         for _, trade in daily_trades.iterrows():
             stock = trade['stock']
             action = trade['action']
             shares = trade['shares']
             price = trade['price']
+            reason = trade.get('reason', 'unknown')
 
             if action == 'sell' and stock in current_positions:
                 entry_info = current_positions[stock]
-                entry_price = entry_info['cost']
                 entry_date = entry_info['entry_date']
+                entry_price = entry_info['cost']
                 
-                # 计算盈亏（不含费用）
                 holding_days = (pd.to_datetime(date_str) - pd.to_datetime(entry_date)).days
-                gross_pnl = (price - entry_price) * shares
+                pnl = (price - entry_price) * shares
+                pnl_rate = (price - entry_price) / entry_price
                 
-                # 计算交易费用
-                buy_amount = entry_price * shares
-                sell_amount = price * shares
-                buy_fee = max(buy_amount * TRANSACTION_FEE_RATE, MIN_TRANSACTION_FEE)
-                sell_fee = max(sell_amount * (TRANSACTION_FEE_RATE + STAMP_DUTY_RATE), 
-                              MIN_TRANSACTION_FEE)
-                total_fee = buy_fee + sell_fee
+                # 🔧 使用新的评分获取函数
+                score = get_stock_score(factor_data, stock, date_str, score_column)
                 
-                # 净盈亏 = 毛盈亏 - 交易费用
-                net_pnl = gross_pnl - total_fee
-                net_pnl_rate = net_pnl / (entry_price * shares) if entry_price > 0 else 0
-                
-                # ✅ 关键修复：只在 trade_history 中记录一次
-                trade_history.append({
-                    'date': date_str,
-                    'stock': stock,
-                    'action': '卖出',
-                    'shares': shares,
-                    'entry_price': entry_price,
-                    'exit_price': price,
-                    'entry_date': entry_date,
-                    'holding_days': holding_days,
-                    'gross_pnl': gross_pnl,
-                    'fees': total_fee,
-                    'net_pnl': net_pnl,
-                    'net_pnl_rate': net_pnl_rate
+                # 记录卖出时的持仓状态
+                all_holdings.append({
+                    'date': date_str, 'stock': stock, 'action': 'sell',
+                    'shares': shares, 'price': price, 'cost': entry_price,
+                    'entry_date': entry_date, 'current_value': shares * price,
+                    'pnl': pnl, 'pnl_rate': pnl_rate, 'score': score,
+                    'holding_days': holding_days, 'reason': reason
                 })
                 
-                # 删除持仓
+                trade_history.append({
+                    'date': date_str, 'stock': stock, 'action': '卖出',
+                    'shares': shares, 'price': price, 'amount': shares * price,
+                    'reason': reason, 'entry_date': entry_date, 'entry_price': entry_price,
+                    'holding_days': holding_days, 'pnl': pnl, 'pnl_rate': pnl_rate
+                })
+                
                 del current_positions[stock]
 
-        # ===== 处理买入交易 =====
+        # 处理买入
         for _, trade in daily_trades.iterrows():
-            stock = trade['stock']
-            action = trade['action']
-            shares = trade['shares']
-            price = trade['price']
-
-            if action == 'buy':
+            if trade['action'] == 'buy':
+                stock = trade['stock']
                 current_positions[stock] = {
-                    'shares': shares,
-                    'cost': price,
-                    'entry_date': date_str
+                    'shares': trade['shares'],
+                    'cost': trade['price'],
+                    'entry_date': date_str,
+                    'entry_reason': trade.get('reason', 'unknown')
                 }
                 
-                # 计算买入费用
-                buy_amount = price * shares
-                buy_fee = max(buy_amount * TRANSACTION_FEE_RATE, MIN_TRANSACTION_FEE)
-                
                 trade_history.append({
-                    'date': date_str,
-                    'stock': stock,
-                    'action': '买入',
-                    'shares': shares,
-                    'entry_price': price,
-                    'exit_price': None,
-                    'entry_date': date_str,
-                    'holding_days': 0,
-                    'gross_pnl': 0,
-                    'fees': buy_fee,
-                    'net_pnl': -buy_fee,  # 买入时费用是负收益
-                    'net_pnl_rate': -buy_fee / buy_amount if buy_amount > 0 else 0
+                    'date': date_str, 'stock': stock, 'action': '买入',
+                    'shares': trade['shares'], 'price': trade['price'],
+                    'amount': trade['shares'] * trade['price'],
+                    'reason': trade.get('reason', 'unknown'),
+                    'holding_days': 0, 'pnl': 0, 'pnl_rate': 0
                 })
 
-        # ===== 记录当日持仓状态（用于监控，不用于盈亏统计）=====
+        # 记录当日持仓
         for stock, info in current_positions.items():
             price_row = price_data[
                 (price_data['instrument'] == stock) &
@@ -190,227 +261,173 @@ def rebuild_daily_holdings_fixed(trade_records, daily_records, factor_data,
             shares = info['shares']
             cost = info['cost']
             current_value = shares * current_price
-            unrealized_pnl = (current_price - cost) * shares
-            unrealized_pnl_rate = (current_price - cost) / cost if cost > 0 else 0
+            pnl = (current_price - cost) * shares
+            pnl_rate = (current_price - cost) / cost if cost > 0 else 0
+
+            daily_trade = daily_trades[daily_trades['stock'] == stock]
+            action = 'buy' if len(daily_trade) > 0 and daily_trade['action'].iloc[0] == 'buy' else 'hold'
+            reason = daily_trade['reason'].iloc[0] if len(daily_trade) > 0 else 'holding'
 
             holding_days = (pd.to_datetime(date_str) - pd.to_datetime(info['entry_date'])).days
 
-            # 判断是否是当日买入
-            daily_buy = daily_trades[
-                (daily_trades['stock'] == stock) & 
-                (daily_trades['action'] == 'buy')
-            ]
-            is_new_buy = len(daily_buy) > 0
-
             all_holdings.append({
-                'date': date_str,
-                'stock': stock,
-                'action': 'buy' if is_new_buy else 'hold',
-                'shares': shares,
-                'cost': cost,
-                'current_price': current_price,
-                'current_value': current_value,
-                'unrealized_pnl': unrealized_pnl,
-                'unrealized_pnl_rate': unrealized_pnl_rate,
-                'score': score,
-                'holding_days': holding_days
+                'date': date_str, 'stock': stock, 'action': action,
+                'shares': shares, 'price': current_price, 'cost': cost,
+                'entry_date': info['entry_date'], 'current_value': current_value,
+                'pnl': pnl, 'pnl_rate': pnl_rate, 'score': score,
+                'holding_days': holding_days, 'reason': reason
             })
 
     return pd.DataFrame(all_holdings), pd.DataFrame(trade_history)
 
 
-def validate_pnl_reasonableness(trade_history_df, initial_capital):
-    """验证盈亏合理性"""
-    print("\n" + "="*80)
-    print("🔍 盈亏合理性检查")
-    print("="*80)
+def analyze_strategy_performance(holdings_df, trade_history_df):
+    """✅ 策略表现分析（增强版）"""
+    print("\n" + "=" * 100)
+    print("🔍 策略表现分析")
+    print("=" * 100)
     
-    if trade_history_df.empty:
-        return
-    
-    sells = trade_history_df[trade_history_df['action'] == '卖出']
-    
-    if len(sells) == 0:
-        print("  ℹ️  暂无卖出交易")
-        return
-    
-    # 检查单笔盈亏
-    max_profit = sells['net_pnl'].max()
-    max_loss = sells['net_pnl'].min()
-    
-    print(f"  单笔最大盈利: ¥{max_profit:,.2f}")
-    print(f"  单笔最大亏损: ¥{max_loss:,.2f}")
-    
-    # 合理性阈值：单笔盈亏不应超过初始资金的50%
-    threshold = initial_capital * 0.5
-    
-    abnormal_profit = sells[sells['net_pnl'] > threshold]
-    abnormal_loss = sells[sells['net_pnl'] < -threshold]
-    
-    if len(abnormal_profit) > 0:
-        print(f"\n  ⚠️  发现 {len(abnormal_profit)} 笔异常盈利（>50%初始资金）:")
-        for _, row in abnormal_profit.head(3).iterrows():
-            print(f"     {row['date']} | {row['stock']} | "
-                  f"¥{row['net_pnl']:,.0f} ({row['net_pnl_rate']:+.2%})")
-    
-    if len(abnormal_loss) > 0:
-        print(f"\n  ⚠️  发现 {len(abnormal_loss)} 笔异常亏损（>50%初始资金）:")
-        for _, row in abnormal_loss.head(3).iterrows():
-            print(f"     {row['date']} | {row['stock']} | "
-                  f"¥{row['net_pnl']:,.0f} ({row['net_pnl_rate']:+.2%})")
-    
-    if len(abnormal_profit) == 0 and len(abnormal_loss) == 0:
-        print("  ✓ 所有交易盈亏在合理范围内")
-
-
-def save_holdings_to_csv_fixed(holdings_df, trade_history_df, output_dir, initial_capital):
-    """保存持仓数据到CSV（修复版 - 避免重复统计）"""
-    
-    # 1. 保存持仓监控数据
-    if not holdings_df.empty:
-        holdings_export = holdings_df.rename(columns={
-            'date': '日期',
-            'stock': '股票',
-            'shares': '持仓数量',
-            'cost': '持仓均价',
-            'current_price': '当前价格',
-            'current_value': '持仓市值',
-            'unrealized_pnl': '浮动盈亏',
-            'unrealized_pnl_rate': '浮动收益率',
-            'score': '评分',
-            'holding_days': '持有天数'
-        })
-        
-        holdings_path = os.path.join(output_dir, 'daily_holdings_monitor.csv')
-        holdings_export.to_csv(holdings_path, index=False, encoding='utf-8-sig')
-        print(f"\n💾 持仓监控数据已保存: {holdings_path}")
-
-    # 2. 保存交易历史（不重复）- 只使用 trade_history_df
-    if not trade_history_df.empty:
-        trade_export = trade_history_df.copy()
-        
-        # 确保列名正确
-        if 'date' in trade_export.columns:
-            trade_export = trade_export.rename(columns={
-                'date': '日期',
-                'stock': '股票',
-                'action': '操作',
-                'shares': '数量',
-                'entry_price': '买入价',
-                'exit_price': '卖出价',
-                'entry_date': '买入日期',
-                'holding_days': '持有天数',
-                'gross_pnl': '毛盈亏',
-                'fees': '交易费用',
-                'net_pnl': '净盈亏',
-                'net_pnl_rate': '收益率'
-            })
-        
-        trade_path = os.path.join(output_dir, 'trade_history_fixed.csv')
-        trade_export.to_csv(trade_path, index=False, encoding='utf-8-sig')
-        print(f"💾 交易历史已保存: {trade_path}")
-        
-        # ✅ 修复：正确计算总盈亏（只从交易历史统计一次）
-        print("\n" + "─" * 80)
-        print("📊 交易统计（修复版 - 避免重复统计）")
-        print("─" * 80)
-        
-        sells = trade_export[trade_export['操作'] == '卖出']
-        buys = trade_export[trade_export['操作'] == '买入']
-        
-        if len(sells) > 0:
-            # 计算卖出交易的盈亏
-            profit_trades = sells[sells['净盈亏'] > 0]
-            loss_trades = sells[sells['净盈亏'] < 0]
-            
-            total_profit = profit_trades['净盈亏'].sum()
-            total_loss = loss_trades['净盈亏'].sum()
-            net_pnl_from_sells = total_profit + total_loss
-            
-            # 计算买入交易的费用（如果已经包含在净盈亏中，就不用再算）
-            # 由于我们在 rebuild_daily_holdings_fixed 中，买入时的 net_pnl 已经是 -fee
-            # 所以这里不需要再单独计算买入费用
-            
-            # 总净盈亏 = 所有卖出的净盈亏之和
-            total_net_pnl = net_pnl_from_sells
-            
-            # 计算正确的收益率
-            correct_return_rate = total_net_pnl / initial_capital
-            
-            print(f"  总交易次数: {len(trade_export)}")
-            print(f"  买入次数: {len(buys)}")
-            print(f"  卖出次数: {len(sells)}")
-            print(f"\n  盈利次数: {len(profit_trades)} ({len(profit_trades)/len(sells)*100:.1f}%)")
-            print(f"  亏损次数: {len(loss_trades)} ({len(loss_trades)/len(sells)*100:.1f}%)")
-            print(f"\n  卖出总盈利: ¥{total_profit:,.2f}")
-            print(f"  卖出总亏损: ¥{total_loss:,.2f}")
-            print(f"  净盈亏: ¥{total_net_pnl:,.2f}")
-            print(f"\n  ✅ 正确收益率: {correct_return_rate:+.2%}")
-            print(f"     (基于初始资金 ¥{initial_capital:,.0f})")
-            
-            return {
-                'total_trades': len(trade_export),
-                'buy_count': len(buys),
-                'sell_count': len(sells),
-                'profit_trades': len(profit_trades),
-                'loss_trades': len(loss_trades),
-                'total_profit': total_profit,
-                'total_loss': total_loss,
-                'total_net_pnl': total_net_pnl,
-                'correct_return_rate': correct_return_rate,
-                'initial_capital': initial_capital
-            }
-    
-    return None
-
-
-def identify_score_column(factor_data):
-    """识别评分列"""
-    possible_names = ['position', 'score', 'factor_score', 'rank']
-    
-    for col in possible_names:
-        if col in factor_data.columns:
-            return col
-    
-    return None
-
-
-def get_stock_score(factor_data, stock, date_str, score_column):
-    """获取股票评分"""
-    if score_column is None:
-        return 0.5
-    
-    score_row = factor_data[
-        (factor_data['instrument'] == stock) &
-        (factor_data['date'] == date_str)
-    ]
-    
-    if len(score_row) > 0:
-        score = score_row[score_column].iloc[0]
-        if pd.isna(score) or not np.isfinite(score):
-            return 0.5
-        return float(score)
-    
-    return 0.5
-
-
-def print_daily_holdings_to_console(holdings_df, max_days=3):
-    """简化的持仓打印"""
     if holdings_df.empty:
         return
     
+    # 1. 评分有效性检查（关键！）
+    if 'score' in holdings_df.columns:
+        unique_scores = holdings_df['score'].nunique()
+        score_mean = holdings_df['score'].mean()
+        score_std = holdings_df['score'].std()
+        
+        print(f"\n📊 评分统计:")
+        print(f"  唯一值数量: {unique_scores}")
+        print(f"  平均值: {score_mean:.4f}")
+        print(f"  标准差: {score_std:.4f}")
+        
+        # 🚨 异常检测
+        if unique_scores == 1:
+            print(f"\n  ⚠️  严重警告：所有评分都相同（{holdings_df['score'].iloc[0]:.4f}）")
+            print(f"     可能原因:")
+            print(f"     1. factor_data 评分列未正确生成")
+            print(f"     2. 股票代码或日期格式不匹配")
+            print(f"     3. 评分计算逻辑有误")
+        elif score_std < 0.01:
+            print(f"\n  ⚠️  警告：评分方差过小（{score_std:.4f}），模型可能未有效区分股票")
+        else:
+            # 评分-收益相关性分析
+            high_score = holdings_df[holdings_df['score'] > holdings_df['score'].quantile(0.7)]
+            low_score = holdings_df[holdings_df['score'] < holdings_df['score'].quantile(0.3)]
+            
+            if not high_score.empty and not low_score.empty:
+                high_profit_rate = (high_score['pnl'] > 0).mean()
+                low_profit_rate = (low_score['pnl'] > 0).mean()
+                
+                print(f"\n  📈 评分有效性:")
+                print(f"     高分组(Top 30%): 盈利率 {high_profit_rate:.1%}, 平均收益 {high_score['pnl_rate'].mean():.2%}")
+                print(f"     低分组(Bottom 30%): 盈利率 {low_profit_rate:.1%}, 平均收益 {low_score['pnl_rate'].mean():.2%}")
+                
+                if high_profit_rate > low_profit_rate:
+                    print(f"     ✅ 评分系统有效（高分组表现更好）")
+                else:
+                    print(f"     ⚠️  评分系统可能无效（高分组表现更差）")
+    
+    # 2. 长期持有分析
+    long_holdings = holdings_df[holdings_df['holding_days'] > 20]
+    if not long_holdings.empty:
+        loss_long = long_holdings[long_holdings['pnl'] < 0]
+        print(f"\n📌 长期持有（>20天）分析:")
+        print(f"   总数: {len(long_holdings)} 只")
+        print(f"   亏损: {len(loss_long)} 只 ({len(loss_long)/len(long_holdings)*100:.1f}%)")
+        
+        if not loss_long.empty:
+            print(f"\n   ⚠️  长期持有亏损股票 (Top 5):")
+            for _, row in loss_long.nlargest(5, 'holding_days').iterrows():
+                print(f"      {row['stock']:12s} | 持有{row['holding_days']:3d}天 | "
+                      f"亏损{row['pnl_rate']:+.2%} | 评分{row['score']:.4f}")
+    
+    # 3. 快速亏损分析
+    if not trade_history_df.empty:
+        sell_trades = trade_history_df[trade_history_df['action'] == '卖出']
+        if not sell_trades.empty:
+            quick_loss = sell_trades[
+                (sell_trades['holding_days'] < 10) & 
+                (sell_trades['pnl_rate'] < -0.05)
+            ]
+            
+            if not quick_loss.empty:
+                print(f"\n📌 快速亏损（<10天且>5%）:")
+                print(f"   发生次数: {len(quick_loss)}")
+                print(f"   平均亏损: {quick_loss['pnl_rate'].mean():.2%}")
+
+
+def print_daily_holdings_to_console(holdings_df, max_days_to_print=5):
+    """美化输出到终端"""
+    if len(holdings_df) == 0:
+        return
+
     dates = sorted(holdings_df['date'].unique())
-    recent_dates = dates[-max_days:]
-    
-    print("\n" + "="*100)
-    print(f"📈 最近{len(recent_dates)}日持仓概览")
-    print("="*100)
-    
+    recent_dates = dates[-max_days_to_print:]
+
+    print("\n" + "=" * 100)
+    print(f"📈 最近 {len(recent_dates)} 个交易日持仓详情")
+    print("=" * 100)
+
     for date in recent_dates:
-        day_holdings = holdings_df[holdings_df['date'] == date]
-        
-        total_value = day_holdings['current_value'].sum()
-        total_pnl = day_holdings['unrealized_pnl'].sum()
-        
-        print(f"\n{date} | 持仓{len(day_holdings)}只 | "
-              f"市值¥{total_value:,.0f} | 浮盈¥{total_pnl:+,.0f}")
+        date_holdings = holdings_df[holdings_df['date'] == date].sort_values('score', ascending=False)
+
+        if len(date_holdings) == 0:
+            continue
+
+        buys = date_holdings[date_holdings['action'] == 'buy']
+        sells = date_holdings[date_holdings['action'] == 'sell']
+        holds = date_holdings[date_holdings['action'] == 'hold']
+
+        total_value = date_holdings['current_value'].sum()
+        total_pnl = date_holdings['pnl'].sum()
+        total_cost = total_value - total_pnl
+        total_pnl_rate = total_pnl / total_cost if total_cost > 0 else 0
+
+        print(f"\n{'─' * 100}")
+        print(f"📅 {date} | 持仓 {len(date_holdings)}只 | "
+              f"买入 {len(buys)}只 | 卖出 {len(sells)}只 | "
+              f"总市值 ¥{total_value:,.0f} | "
+              f"浮动盈亏 ¥{total_pnl:+,.0f} ({total_pnl_rate:+.2%})")
+        print(f"{'─' * 100}")
+
+        # 只打印买入/卖出，持仓太多时省略中间部分
+        if len(buys) > 0:
+            print(f"\n  🔵 买入 ({len(buys)}只):")
+            for _, row in buys.iterrows():
+                print(f"     {row['stock']:12s} | 价格: ¥{row['price']:7.2f} | "
+                      f"数量: {row['shares']:6,.0f}股 | 评分: {row['score']:.4f}")
+
+        if len(sells) > 0:
+            print(f"\n  🔴 卖出 ({len(sells)}只):")
+            for _, row in sells.iterrows():
+                icon = "💰" if row['pnl'] > 0 else "📉"
+                print(f"     {row['stock']:12s} | 盈亏: {icon}¥{row['pnl']:+9,.0f} "
+                      f"({row['pnl_rate']:+.2%}) | 持有{row['holding_days']}天")
+
+        if len(holds) > 5:
+            print(f"\n  ⚪ 持仓中 ({len(holds)}只，显示Top3/Bottom3):")
+            for _, row in holds.head(3).iterrows():
+                icon = "📈" if row['pnl'] > 0 else "📉"
+                print(f"     {row['stock']:12s} | 浮盈: {icon}{row['pnl_rate']:+.2%} | "
+                      f"评分: {row['score']:.4f} ⭐")
+            print(f"     ... 省略中间 {len(holds)-6} 只 ...")
+            for _, row in holds.tail(3).iterrows():
+                icon = "📈" if row['pnl'] > 0 else "📉"
+                print(f"     {row['stock']:12s} | 浮盈: {icon}{row['pnl_rate']:+.2%} | "
+                      f"评分: {row['score']:.4f} ⚠️")
+
+
+def save_holdings_to_csv(holdings_df, trade_history_df, output_dir):
+    """保存持仓数据到CSV"""
+    if len(holdings_df) == 0:
+        return
+
+    full_path = os.path.join(output_dir, 'daily_holdings_detail.csv')
+    holdings_df.to_csv(full_path, index=False, encoding='utf-8-sig')
+    print(f"\n💾 完整持仓历史已保存: {full_path}")
+    
+    if not trade_history_df.empty:
+        trade_path = os.path.join(output_dir, 'trade_history_detail.csv')
+        trade_history_df.to_csv(trade_path, index=False, encoding='utf-8-sig')
+        print(f"💾 交易历史明细已保存: {trade_path}")

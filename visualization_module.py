@@ -47,12 +47,10 @@ def generate_performance_report(context, output_dir='./reports'):
             initial_capital = first_record['portfolio_value']
     
     final_value = daily_records['portfolio_value'].iloc[-1]
-    
-    # ✅ 修复：正确计算总收益率（基于初始资金而非第一天的组合价值）
     total_return = (final_value - initial_capital) / initial_capital
 
-    # ✨ 修复：年化收益率计算（按照年化收益率计算规范）
-    years = trading_days / 365  # 使用365天而非252天
+    # ✨ 修复：年化收益率计算
+    years = trading_days / 252
     if years > 0 and total_return > -1:  # 确保本金未完全亏损
         annualized_return = (1 + total_return) ** (1 / years) - 1
     else:
@@ -73,7 +71,7 @@ def generate_performance_report(context, output_dir='./reports'):
     if len(daily_returns) > 1:
         volatility_daily = daily_returns.std()
         annualized_volatility = volatility_daily * np.sqrt(252)
-        
+
         # 夏普比率（假设无风险利率3%）
         risk_free_rate = 0.03
         excess_return = annualized_return - risk_free_rate
@@ -82,41 +80,25 @@ def generate_performance_report(context, output_dir='./reports'):
         annualized_volatility = 0
         sharpe_ratio = 0
 
-    # 交易指标（基于trade_history_detail.csv中的数据）
+    # 交易指标
     sell_trades = trade_records[trade_records['action'] == 'sell']
-    
-    # 初始化指标
-    total_profit = 0
-    total_loss = 0
-    net_pnl = 0
-    total_fees = 0
-    win_rate = 0
-    avg_holding_days = 0
-    avg_profit = 0
-    avg_loss = 0
-    profit_loss_ratio = 0
-    
+
     if len(sell_trades) > 0:
-        # 按照用户要求的方式计算盈亏（与holdings_monitor.py保持一致）
+        win_rate = (sell_trades['pnl'] > 0).sum() / len(sell_trades)
+        avg_holding_days = sell_trades['holding_days'].mean()
+
         profit_trades = sell_trades[sell_trades['pnl'] > 0]
         loss_trades = sell_trades[sell_trades['pnl'] < 0]
-        
-        # 总盈利（只算正的盈亏部分）
-        total_profit = profit_trades['pnl'].sum()
-        # 总亏损（只算负的盈亏部分）
-        total_loss = loss_trades['pnl'].sum()
-        # 净盈亏 = 总盈利 + 总亏损
-        net_pnl = total_profit + total_loss
-        # 交易费用总和（这里需要从context或其他地方获取交易费用信息）
-        # 由于trade_records中没有费用信息，我们需要从其他途径获取
-        total_fees = sell_trades['fee'].sum() if 'fee' in sell_trades.columns else 0
-        
-        win_rate = len(profit_trades) / len(sell_trades) if len(sell_trades) > 0 else 0
-        avg_holding_days = sell_trades['holding_days'].mean() if 'holding_days' in sell_trades.columns else 0
-        
+
         avg_profit = profit_trades['pnl'].mean() if len(profit_trades) > 0 else 0
         avg_loss = loss_trades['pnl'].mean() if len(loss_trades) > 0 else 0
         profit_loss_ratio = abs(avg_profit / avg_loss) if avg_loss != 0 else 0
+    else:
+        win_rate = 0
+        avg_holding_days = 0
+        avg_profit = 0
+        avg_loss = 0
+        profit_loss_ratio = 0
 
     # 当前持仓
     positions = context.get('positions', {})
@@ -141,13 +123,7 @@ def generate_performance_report(context, output_dir='./reports'):
         f.write(f"最终资产: ¥{final_value:,.2f}\n")
         f.write(f"总收益: ¥{final_value - initial_capital:,.2f}\n")
         f.write(f"总收益率: {total_return:+.2%}\n")
-        f.write(f"年化收益率: {annualized_return:+.2%}\n")
-        f.write(f"总盈利 (正盈亏部分): ¥{total_profit:,.2f}\n")
-        f.write(f"总亏损 (负盈亏部分): ¥{total_loss:,.2f}\n")
-        f.write(f"净盈亏 (总盈利 + 总亏损): ¥{net_pnl:,.2f}\n")
-        f.write(f"交易费用总和: ¥{total_fees:,.2f}\n")
-        f.write(f"扣除费用后净盈亏: ¥{net_pnl - total_fees:,.2f}\n")
-        f.write(f"净收益率: {(net_pnl - total_fees) / initial_capital if initial_capital > 0 else 0:+.2%}\n\n")
+        f.write(f"年化收益率: {annualized_return:+.2%}\n\n")
 
         f.write("【风险指标】\n")
         f.write(f"最大回撤: {max_drawdown:.2%}\n")
@@ -191,12 +167,6 @@ def generate_performance_report(context, output_dir='./reports'):
     print("【收益指标】")
     print(f"  总收益率: {total_return:+.2%}")
     print(f"  年化收益率: {annualized_return:+.2%}")
-    print(f"  总盈利 (正盈亏部分): ¥{total_profit:,.2f}")
-    print(f"  总亏损 (负盈亏部分): ¥{total_loss:,.2f}")
-    print(f"  净盈亏 (总盈利 + 总亏损): ¥{net_pnl:,.2f}")
-    print(f"  交易费用总和: ¥{total_fees:,.2f}")
-    print(f"  扣除费用后净盈亏: ¥{net_pnl - total_fees:,.2f}")
-    print(f"  净收益率: {(net_pnl - total_fees) / initial_capital if initial_capital > 0 else 0:+.2%}")
 
     print("\n【风险指标】")
     print(f"  最大回撤: {max_drawdown:.2%}")
@@ -220,22 +190,17 @@ def generate_performance_report(context, output_dir='./reports'):
                           pd.to_datetime(info['entry_date'])).days
             print(f"    {stock}: {info['shares']} 股 @ ¥{info['cost']:.2f} "
                   f"(买入: {info['entry_date']}, 持有{holding_days}天)")
+
+    print()
     
-    # 返回绩效信息供其他函数使用
     return {
+        'initial_capital': initial_capital,
+        'final_value': final_value,
         'total_return': total_return,
         'annualized_return': annualized_return,
         'max_drawdown': max_drawdown,
         'sharpe_ratio': sharpe_ratio,
-        'volatility': annualized_volatility,
-        'initial_capital': initial_capital,
-        'final_value': final_value,
-        'total_profit': total_profit,
-        'total_loss': total_loss,
-        'net_pnl': net_pnl,
-        'total_fees': total_fees,
-        'net_pnl_after_fees': net_pnl - total_fees,
-        'net_return': (net_pnl - total_fees) / initial_capital if initial_capital > 0 else 0
+        'win_rate': win_rate
     }
 
 

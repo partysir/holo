@@ -31,10 +31,7 @@ class StrategyConfig:
     """
 
     # 调试模式
-    DEBUG_MODE = True  # 是否显示详细交易日志
-
-    # 大盘择时
-    ENABLE_MARKET_TIMING = False  # 是否启用大盘择时
+    DEBUG_MODE = False  # 是否显示详细交易日志
 
 
 # ========== 回测参数 ==========
@@ -46,16 +43,16 @@ class BacktestConfig:
     END_DATE = datetime.now().strftime('%Y-%m-%d')
 
     # 资金配置
-    CAPITAL_BASE = 1000000  # 初始资金（从10万修正为100万）
+    CAPITAL_BASE = 1000000  # 初始资金
 
     # 持仓配置
-    POSITION_SIZE: int = 5  # 持仓数量
-    REBALANCE_DAYS: int = 5  # 调仓周期（天）
+    POSITION_SIZE = 10  # 持仓数量
+    REBALANCE_DAYS = 5  # 调仓周期（天）
     POSITION_METHOD = 'equal'  # 仓位分配方法（v1.0使用）
 
     # 风险控制（通用）
     STOP_LOSS = -0.15  # 止损阈值
-    TAKE_PROFIT = 0.18  # 止盈阈值（None=不止盈）
+    TAKE_PROFIT = None  # 止盈阈值（None=不止盈）
     SCORE_THRESHOLD = 0.10  # 换仓阈值（v1.0使用）
     SCORE_DECAY_RATE = 1.0  # 评分衰减率（v1.0使用）
     FORCE_REPLACE_DAYS = 20  # 强制换仓天数（v1.0使用）
@@ -70,12 +67,12 @@ class RiskControlConfig:
 
     # 1. 因子衰减止损
     ENABLE_SCORE_DECAY_STOP = True  # 启用因子衰减止损
-    SCORE_DECAY_THRESHOLD = 0.20  # 评分下降20%止损  # 从0.30收紧到0.20
+    SCORE_DECAY_THRESHOLD = 0.30  # 评分下降30%止损
     MIN_HOLDING_DAYS = 5  # 最少持有5天
 
     # 2. 相对排名止损
     ENABLE_RANK_STOP = True  # 启用相对排名止损
-    RANK_PERCENTILE_THRESHOLD = 0.90  # 跌出前85%止损  # 从0.80提高到0.85
+    RANK_PERCENTILE_THRESHOLD = 0.80  # 跌出前70%止损
 
     # 3. 组合回撤保护
     MAX_PORTFOLIO_DRAWDOWN = -0.15  # 组合回撤-15%降仓
@@ -126,7 +123,6 @@ class FactorConfig:
     # 模型选择
     USE_STOCKRANKER = True  # 使用StockRanker模型
     USE_FUNDAMENTAL = True  # 使用基本面因子
-    USE_MONEY_FLOW = True  # ✅ 新增：启用资金流因子
 
     # 自定义权重（None=使用默认）
     CUSTOM_WEIGHTS = None
@@ -134,17 +130,6 @@ class FactorConfig:
     # IC调整
     ENABLE_IC_ADJUSTMENT = True  # 启用IC动态调权
     IC_ADJUSTMENT_DECAY = 0.7  # IC调权衰减系数
-
-    # ✅ 新增：资金流因子配置
-    MONEY_FLOW_CONFIG = {
-        'use_full_tick': False,           # 是否使用完整tick数据
-        'weight_main_netflow': 0.10,      # 主力净流入权重
-        'weight_main_strength': 0.08,     # 主力强度权重
-        'weight_large_netflow': 0.07,     # 超大单净流入权重
-        'main_continuous_inflow': 0.05,      # 主力持续流入
-        'main_vs_retail_ratio': 0.05,        # 主力散户对比
-        'main_activity': 0.05,               # 主力活跃度       
-    }
 
 
 # ========== 高级ML配置 ==========
@@ -157,7 +142,7 @@ class MLConfig:
     # 模型参数
     ML_MODEL_TYPE = 'xgboost'  # 模型类型：'xgboost', 'lightgbm', 'random_forest'
     ML_TARGET_PERIOD = 5  # 预测周期（天）
-    ML_TOP_PERCENTILE = 0.10  # 预测TOP 10%  # 从0.20改为0.10
+    ML_TOP_PERCENTILE = 0.20  # 预测TOP 20%
 
     # 训练参数
     ML_USE_CLASSIFICATION = True  # 使用分类模型（预测TOP股票）
@@ -165,8 +150,17 @@ class MLConfig:
     ML_TRAIN_MONTHS = 12  # Walk-Forward训练窗口（月）
 
     # 选股参数
-    ML_MIN_SCORE = 0.65  # 最低评分阈值
+    ML_MIN_SCORE = 0.6  # 最低评分阈值
 
+    """机器学习配置"""
+    USE_ADVANCED_ML = True
+    ML_MODEL_TYPE = 'xgboost'  # 'xgboost' 或 'lightgbm'
+    ML_TARGET_PERIOD = 5
+    ML_TOP_PERCENTILE = 0.20
+    ML_USE_CLASSIFICATION = True
+    ML_USE_IC_FEATURES = True
+    ML_TRAIN_MONTHS = 12
+    
     # ========== 新增配置 ==========
     ML_MODEL_DIR = './models'        # 模型保存目录
     ML_AUTO_SAVE = True              # 是否自动保存模型
@@ -228,7 +222,10 @@ class NotificationConfig:
 # ========== 便捷函数 ==========
 def get_config(config_class):
     """获取配置字典"""
-    return {k: v for k, v in config_class.__dict__.items() if not k.startswith('_')}
+    return {
+        k: v for k, v in config_class.__dict__.items()
+        if not k.startswith('_')
+    }
 
 
 def print_all_configs():
@@ -241,8 +238,6 @@ def print_all_configs():
     for k, v in get_config(StrategyConfig).items():
         if k == 'CASH_RESERVE_RATIO':
             print(f"  {k}: {v:.1%} (目标资金利用率: {1-v:.1%})")
-        elif k == 'ENABLE_MARKET_TIMING':
-            print(f"  {k}: {'启用' if v else '禁用'}")
         else:
             print(f"  {k}: {v}")
 
@@ -331,9 +326,6 @@ def get_strategy_params():
 
         # v2.0 新增
         'cash_reserve_ratio': StrategyConfig.CASH_RESERVE_RATIO,
-        
-        # 大盘择时
-        'enable_market_timing': StrategyConfig.ENABLE_MARKET_TIMING,
 
         # 风控参数
         'enable_score_decay_stop': RiskControlConfig.ENABLE_SCORE_DECAY_STOP,
@@ -347,8 +339,7 @@ def get_strategy_params():
         'max_industry_weight': RiskControlConfig.MAX_INDUSTRY_WEIGHT,
         'extreme_loss_threshold': RiskControlConfig.EXTREME_LOSS_THRESHOLD,
         'portfolio_loss_threshold': RiskControlConfig.PORTFOLIO_LOSS_THRESHOLD,
-        'take_profit': BacktestConfig.TAKE_PROFIT, # ✅ 传递止盈参数
-        
+
         # 交易成本
         'buy_cost': TradingCostConfig.BUY_COST,
         'sell_cost': TradingCostConfig.SELL_COST,
