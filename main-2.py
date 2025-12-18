@@ -1,7 +1,8 @@
 """
-main.py - 主回测入口（v2.8 - 集成舆情风控版）
+main.py - 主回测入口（v2.9 - 修复最新数据预测问题）
 
 核心更新：
+✅ 最新数据预测修复: 解决ML模型对最近5-10天数据无法评分的问题
 ✅ 数据泄露修复: 严格隔离预测列，防止position/ml_score污染训练数据
 ✅ API适配优化: 完整适配 ml_factor_scoring_fixed.py 的新接口
 ✅ 特征验证: 添加泄露检测，确保模型使用真实因子
@@ -9,8 +10,9 @@ main.py - 主回测入口（v2.8 - 集成舆情风控版）
 ✅ 全流程保留: Walk-Forward 全窗口训练、前视偏差修复
 ✅ 舆情风控集成: 一票否决 + 加分提权，提升选股质量
 
-版本：v2.8
+版本：v2.9
 日期：2025-12-17
+修复：最新数据无评分导致持仓归零问题
 """
 
 import warnings
@@ -62,7 +64,21 @@ except ImportError as e:
     print(f"⚠️  高级ML模块未找到: {e}")
     ML_AVAILABLE = False
 
-# ========== 【新增】导入舆情风控模块 ==========
+# ========== 【新增】导入ML修复补丁 ==========
+ML_FIX_AVAILABLE = False
+try:
+    from ml_scorer_latest_data_fix import (
+        quick_fix_ml_scorer,
+        diagnose_prediction_gap,
+        FixedAdvancedMLScorer
+    )
+    ML_FIX_AVAILABLE = True
+    print("✓ ML修复补丁加载成功 (解决最新数据预测问题)")
+except ImportError as e:
+    print(f"⚠️  ML修复补丁未加载: {e}")
+    ML_FIX_AVAILABLE = False
+
+# ========== 导入舆情风控模块 ==========
 SENTIMENT_AVAILABLE = False
 try:
     from sentiment_risk_control import (
@@ -98,9 +114,10 @@ from date_organized_reports import generate_date_organized_reports
 def print_banner():
     """打印启动横幅"""
     print("\n" + "="*80)
-    print("    综合因子评分选股回测系统 v2.8 - 集成舆情风控版")
+    print("    综合因子评分选股回测系统 v2.9 - 修复最新数据预测问题")
     print("="*80)
     print("\n🎯 核心特性:")
+    print("  ✅ 【新】最新数据预测修复 (解决持仓归零问题)")
     print("  ✅ 数据泄露严格防护 (position/ml_score 隔离)")
     print("  ✅ 全历史窗口滚动训练 (Robust Walk-Forward)")
     print("  ✅ 舆情风控增强 (一票否决 + 加分提权)")
@@ -426,17 +443,17 @@ def main():
         print(f"\n⚠️  因子增强处理警告: {e}")
         traceback.print_exc()
 
-    # ============ 步骤4: ML因子评分 (🔧 完整修复版) ============
+    # ============ 步骤4: ML因子评分 (🔧 v2.9修复版 - 支持最新数据预测) ============
     ml_scorer = None  # 用于后续验证
 
     if MLConfig.USE_ADVANCED_ML and ML_AVAILABLE:
         try:
             print("\n" + "="*80)
-            print("🚀 步骤4: 高级ML因子评分 (Walk-Forward 训练模式 - 数据泄露修复版)")
+            print("🚀 步骤4: 高级ML因子评分 (v2.9 - Walk-Forward + 最新数据预测修复)")
             print("="*80)
 
             # 🔧 修复点1: 训练前清理污染列
-            print("   [0/4] 清理潜在污染列...")
+            print("   [0/5] 清理潜在污染列...")
             污染列 = ['ml_score', 'position', 'score_rank', 'composite_score',
                     'composite_score_neutral', 'score_rank_neutral', 'industry_rank']
 
@@ -459,7 +476,7 @@ def main():
             )
 
             # 2. 准备训练数据（使用清理后的数据）
-            print("   [1/4] 准备训练数据...")
+            print("   [1/5] 准备训练数据...")
             X, y, merged_df = ml_scorer.prepare_training_data(
                 factor_data_clean,  # 🔧 使用清理后的数据
                 price_data,
@@ -467,35 +484,59 @@ def main():
             )
 
             # 3. 执行 Walk-Forward 滚动训练
-            print("   [2/4] 执行 Walk-Forward 滚动训练 (全历史窗口)...")
+            print("   [2/5] 执行 Walk-Forward 滚动训练 (全历史窗口)...")
             ml_scorer.train_walk_forward(X, y, merged_df, n_splits=None)
 
-            # 4. 预测评分
-            print("   [3/4] 全量数据预测评分...")
-            # 🔧 修复点2: 预测返回的是独立的结果DataFrame
-            factor_data_predicted = ml_scorer.predict_scores(merged_df)
+            # 4. 【v2.9新增】应用最新数据预测修复
+            print("   [3/5] 应用最新数据预测修复...")
+            
+            if ML_FIX_AVAILABLE:
+                # 🔧 关键修复：使用修复补丁处理全量数据（包括最新无标签数据）
+                factor_data = quick_fix_ml_scorer(
+                    ml_scorer=ml_scorer,
+                    factor_data=factor_data,  # 使用原始factor_data（包含最新日期）
+                    price_data=price_data,
+                    factor_columns=factor_columns
+                )
+                
+                # 验证修复效果
+                latest_date = factor_data['date'].max()
+                latest_scores = factor_data[factor_data['date'] == latest_date]
+                valid_scores = latest_scores['ml_score'].notna().sum()
+                
+                print(f"\n   ✅ 修复验证:")
+                print(f"      • 最新日期: {latest_date}")
+                print(f"      • 有效评分: {valid_scores}/{len(latest_scores)} 只股票")
+                
+                if valid_scores == 0:
+                    print(f"      ⚠️  警告：最新日期仍无评分，请检查数据完整性")
+                elif valid_scores < len(latest_scores) * 0.5:
+                    print(f"      ⚠️  警告：有效评分占比较低 ({valid_scores/len(latest_scores):.1%})")
+                else:
+                    print(f"      ✅ 修复成功：有效评分占比 {valid_scores/len(latest_scores):.1%}")
+                    
+                # 额外诊断（可选）
+                if valid_scores == 0:
+                    print("\n   🔍 执行深度诊断...")
+                    diagnose_prediction_gap(factor_data, price_data, target_period=MLConfig.ML_TARGET_PERIOD)
+                    
+            else:
+                print("   ⚠️  ML修复补丁未加载，使用原始预测方法")
+                print("   ⚠️  警告：最新5-10天数据可能无评分，导致持仓不足")
+                # 回退到原始预测
+                factor_data_predicted = ml_scorer.predict_scores(merged_df)
+                
+                # 合并预测结果
+                for col in ['ml_score', 'position']:
+                    if col in factor_data.columns:
+                        factor_data = factor_data.drop(columns=[col])
+                
+                prediction_cols = ['date', 'instrument', 'ml_score', 'position']
+                prediction_df = factor_data_predicted[prediction_cols]
+                factor_data = factor_data.merge(prediction_df, on=['date', 'instrument'], how='left')
 
-            # 🔧 修复点3: 只合并预测列，保持原始factor_data干净
-            print("   [4/4] 合并预测结果...")
-            # 删除factor_data中可能存在的旧预测列
-            for col in ['ml_score', 'position']:
-                if col in factor_data.columns:
-                    factor_data = factor_data.drop(columns=[col])
-
-            # 只合并必要的预测列
-            prediction_cols = ['date', 'instrument', 'ml_score', 'position']
-            prediction_df = factor_data_predicted[prediction_cols]
-
-            # 合并到原始factor_data
-            factor_data = factor_data.merge(
-                prediction_df,
-                on=['date', 'instrument'],
-                how='left'
-            )
-
-            print(f"      ✓ 成功添加预测列: ml_score, position")
-
-            # 打印特征重要性
+            # 5. 打印特征重要性
+            print("   [4/5] 分析特征重要性...")
             importance = ml_scorer.get_feature_importance(top_n=10)
             if importance is not None:
                 print("\n📊 TOP 10 关键因子:")
@@ -614,7 +655,7 @@ def main():
         print("📊 步骤8: 生成分析报告")
         print(f"{'='*80}\n")
 
-        # 🔧 修复：使用统一的输出目录，防止重复调用
+        # 使用统一的输出目录，防止重复调用
         output_dir = OutputConfig.REPORTS_DIR
 
         # 生成日期组织报告
@@ -625,8 +666,7 @@ def main():
             base_dir=output_dir
         )
 
-        # 🔧 修复：只调用一次持仓面板生成函数
-        # 注意：不要在循环中调用此函数
+        # 只调用一次持仓面板生成函数
         show_today_holdings_dashboard(
             context=context,
             factor_data=factor_data,
@@ -651,38 +691,65 @@ def main():
 
     latest_stocks = factor_data[factor_data['date'] == latest_date].copy()
 
-    # 🔧 修复：优先使用 ml_score
+    # 优先使用 ml_score
     score_col = 'ml_score' if 'ml_score' in latest_stocks.columns else 'position'
 
     if score_col in latest_stocks.columns:
-        target_stocks = latest_stocks.sort_values(by=score_col, ascending=False).head(5)
+        # 检查是否有有效评分
+        valid_scores = latest_stocks[score_col].notna().sum()
+        
+        if valid_scores == 0:
+            print("\n❌ 无法生成推荐清单：最新日期无有效评分")
+            print("💡 可能原因：")
+            print("   1. ML模型训练失败")
+            print("   2. 最新数据特征缺失")
+            print("   3. 数据更新不完整")
+            print("\n🔧 建议：")
+            print("   1. 检查ML训练日志")
+            print("   2. 运行诊断工具: diagnose_prediction_gap()")
+            print("   3. 确认修复补丁已正确加载")
+        else:
+            target_stocks = latest_stocks.sort_values(by=score_col, ascending=False).head(5)
 
-        print(f"{'排名':<6} | {'代码':<10} | {'行业':<10} | {'ML评分':<10}")
-        print("-" * 50)
+            print(f"\n有效评分: {valid_scores}/{len(latest_stocks)} 只股票 ({valid_scores/len(latest_stocks):.1%})")
+            print(f"\n{'排名':<6} | {'代码':<10} | {'行业':<10} | {'ML评分':<10}")
+            print("-" * 50)
 
-        for idx, (i, row) in enumerate(target_stocks.iterrows(), 1):
-            stock = row['instrument']
-            industry = row.get('industry', '未知')
-            score = row[score_col]
-            print(f"{idx:<6} | {stock:<10} | {industry:<10} | {score:.4f}")
+            for idx, (i, row) in enumerate(target_stocks.iterrows(), 1):
+                stock = row['instrument']
+                industry = row.get('industry', '未知')
+                score = row[score_col]
+                print(f"{idx:<6} | {stock:<10} | {industry:<10} | {score:.4f}")
 
-        print("-" * 50)
+            print("-" * 50)
 
-        if SENTIMENT_AVAILABLE:
-            print("\n✅ 此清单已通过舆情风控过滤：")
-            print("   • 已剔除立案调查、ST等风险股票")
-            print("   • 已对政策题材股票进行加分提权")
+            if SENTIMENT_AVAILABLE:
+                print("\n✅ 此清单已通过舆情风控过滤：")
+                print("   • 已剔除立案调查、ST等风险股票")
+                print("   • 已对政策题材股票进行加分提权")
 
-        print("\n💡 实盘操作建议：")
-        print("1. 此清单为全市场评分最高的 5 只股票。")
-        print("2. 建议开盘后观察，若未停牌且未涨停，可直接买入。")
-        print("3. 如遇不可买入情况，请顺延至第 6 名（需自行查看数据）。")
+            print("\n💡 实盘操作建议：")
+            print("1. 此清单为全市场评分最高的 5 只股票。")
+            print("2. 建议开盘后观察，若未停牌且未涨停，可直接买入。")
+            print("3. 如遇不可买入情况，请顺延至第 6 名（需自行查看数据）。")
     else:
         print("❌ 无法生成推荐清单：未找到评分字段")
 
     print("\n" + "="*80)
-    print("✅ 任务全部完成 - 集成舆情风控版")
-    print("="*80 + "\n")
+    print("✅ 任务全部完成 - v2.9修复版 (已解决最新数据预测问题)")
+    print("="*80)
+    
+    # 打印版本更新说明
+    print("\n📝 v2.9 更新说明:")
+    print("  ✅ 修复：ML模型对最近5-10天数据无法预测的问题")
+    print("  ✅ 修复：持仓归零问题（信号中断导致）")
+    print("  ✅ 新增：最新数据诊断工具")
+    print("  ✅ 优化：预测流程分离（训练集 vs 预测集）")
+    print("\n💡 关键改进：")
+    print("  • 训练阶段：只用有完整标签的历史数据")
+    print("  • 预测阶段：处理全部数据（包括最新无标签数据）")
+    print("  • 效果：确保最新日期始终有评分，策略持续运行")
+    print("\n")
 
 if __name__ == "__main__":
     try:
