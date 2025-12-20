@@ -39,7 +39,7 @@ class BacktestConfig:
     """回测配置"""
 
     # 日期范围
-    START_DATE = "2023-01-01"
+    START_DATE = "2021-01-01"
     END_DATE = datetime.now().strftime('%Y-%m-%d')
 
     # 资金配置
