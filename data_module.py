@@ -585,6 +585,29 @@ class StockRankerModel:
         df['return_60d'] = df.groupby('instrument')['close'].pct_change(60)
         return df
 
+    def calculate_alpha_factors(self, df):
+        """添加 Alpha 增强因子"""
+        # Alpha 006: (-1 * Correlation(Open, Volume, 10))
+        # 简化版：开盘价和成交量的相关性
+        grouped = df.groupby('instrument')
+        
+        # 1. 量价相关性 (Smart Money)
+        def rolling_corr(x):
+            return x['close'].rolling(10).corr(x['volume'])
+        
+        # ⚠️ 注意：这里为了性能，可以使用向量化近似，或者只要部分股票
+        # 简单替代：(Close - Open) / (High - Low) * Volume 占比
+        df['intraday_strength'] = (df['close'] - df['open']) / ((df['high'] - df['low']) + 1e-6)
+        
+        # 2. 乖离率 (Bias)
+        df['ma_20'] = grouped['close'].transform(lambda x: x.rolling(20).mean())
+        df['bias_20'] = (df['close'] - df['ma_20']) / df['ma_20']
+        
+        # 3. 波动率倒数 (低波因子)
+        df['low_vol_preference'] = 1.0 / (grouped['close'].transform(lambda x: x.rolling(20).std()) + 1e-6)
+        
+        return df
+
     def process_fundamental_factors(self, df):
         if not self.use_fundamental: return df
         fundamental_cols = ['roe', 'roa', 'gross_margin', 'net_margin', 'debt_ratio']
@@ -604,6 +627,7 @@ class StockRankerModel:
         df = self.calculate_volatility_factors(df)
         df = self.calculate_money_flow_factors(df)
         df = self.calculate_momentum_factors(df)
+        df = self.calculate_alpha_factors(df) # 新增
         if self.use_fundamental:
             df = self.process_fundamental_factors(df)
         return df

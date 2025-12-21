@@ -44,7 +44,30 @@ from config import (
     print_config_comparison
 )
 
-ts.set_token(TUSHARE_TOKEN)
+# ========== 【新增】导入Alpha增强模块 ==========
+try:
+    from factor_based_risk_control_rsrs import run_rsrs_strategy
+    RSRS_AVAILABLE = True
+    print("✓ RSRS择时模块加载成功")
+except ImportError as e:
+    print(f"⚠️  RSRS择时模块未找到: {e}")
+    RSRS_AVAILABLE = False
+
+try:
+    from data_module_alpha_enhanced import EnhancedFactorGenerator
+    ALPHA_ENHANCEMENT_AVAILABLE = True
+    print("✓ Alpha增强因子模块加载成功")
+except ImportError as e:
+    print(f"⚠️  Alpha增强因子模块未找到: {e}")
+    ALPHA_ENHANCEMENT_AVAILABLE = False
+
+try:
+    from ml_factor_scoring_alpha import run_alpha_ml_strategy
+    ALPHA_ML_AVAILABLE = True
+    print("✓ Alpha增强ML模块加载成功")
+except ImportError as e:
+    print(f"⚠️  Alpha增强ML模块未找到: {e}")
+    ALPHA_ML_AVAILABLE = False
 
 # 导入数据模块
 from data_module import DataCache, TushareDataSource
@@ -412,38 +435,38 @@ def print_trading_plan(context, price_data, factor_data):
 def main():
     """主函数"""
     print_banner()
-
+    
     # ========== 显示配置 ==========
     print("【当前配置】")
     print(f"  策略版本: {StrategyConfig.STRATEGY_VERSION}")
     print(f"  回测区间: {BacktestConfig.START_DATE} ~ {BacktestConfig.END_DATE}")
     print(f"  初始资金: ¥{BacktestConfig.CAPITAL_BASE:,}")
     print(f"  持仓数量: {BacktestConfig.POSITION_SIZE} 只")
-
+    
     print_config_comparison()
     validate_configs()
-
+    
     # 从配置获取参数
     START_DATE = BacktestConfig.START_DATE
     END_DATE = BacktestConfig.END_DATE
     CAPITAL_BASE = BacktestConfig.CAPITAL_BASE
     POSITION_SIZE = BacktestConfig.POSITION_SIZE
     REBALANCE_DAYS = BacktestConfig.REBALANCE_DAYS
-
+    
     USE_SAMPLING = DataConfig.USE_SAMPLING
     SAMPLE_SIZE = DataConfig.SAMPLE_SIZE
     if not USE_SAMPLING and SAMPLE_SIZE < 5000:
         SAMPLE_SIZE = 5000
-
+    
     # ========== 关键新增：最短上市时间参数 ==========
     MIN_DAYS_LISTED = 180
     print(f"\n🔒 前视偏差防护:")
     print(f"  - 最短上市时间: {MIN_DAYS_LISTED} 天")
     print(f"  - 效果: 剔除在 {START_DATE} 前 {MIN_DAYS_LISTED} 天内上市的次新股")
-
+    
     # ============ 初始化 ============
     cache_manager = DataCache(cache_dir=DataConfig.CACHE_DIR)
-
+    
     # 步骤0: 获取大盘指数
     benchmark_data = None
     try:
@@ -456,14 +479,14 @@ def main():
             print(f"  ✓ 获取上证指数数据: {len(benchmark_data)} 条")
     except Exception as e:
         print(f"  ⚠️  获取指数失败: {e}")
-
+    
     # ============ 步骤1: 数据加载（修复版） ============
     try:
         data_start_time = time.time()
         print("\n" + "="*80)
         print("📦 步骤1: 数据加载 (v2.3 - 修复前视偏差)")
         print("="*80)
-
+        
         factor_data, price_data = load_data_with_incremental_update(
             START_DATE,
             END_DATE,
@@ -479,33 +502,71 @@ def main():
             max_workers=DataConfig.MAX_WORKERS,
             min_days_listed=MIN_DAYS_LISTED
         )
-
+        
         if factor_data is None or price_data is None:
             print("\n❌ 数据获取失败")
             return
-
+        
         if factor_data.empty or price_data.empty:
             print("\n❌ 获取到的数据为空，请检查日期范围或Token")
             return
-
+        
         print(f"  ✓ 数据加载耗时: {time.time() - data_start_time:.1f} 秒")
-
+        
         # ========== 验证：检查是否还有新股 ==========
         print("\n🔍 数据质量验证:")
         unique_stocks = factor_data['instrument'].unique()
         print(f"  - 股票池大小: {len(unique_stocks)} 只")
-
+        
         new_stock_codes = [s for s in unique_stocks if s.startswith(('920', '8', '4'))]
         if new_stock_codes:
             print(f"  ℹ️  提示：包含 {len(new_stock_codes)} 只北交所/新三板代码")
-
+        
         print(f"  ✅ 数据加载完成，已应用上市时间过滤 (min_days_listed={MIN_DAYS_LISTED})")
-
+        
     except Exception as e:
         print(f"\n❌ 数据加载异常: {e}")
         traceback.print_exc()
         return
-
+    
+    # ============ 【新增】步骤1.2: Alpha增强因子处理 ============
+    if ALPHA_ENHANCEMENT_AVAILABLE:
+        try:
+            print("\n" + "="*80)
+            print("🎯 步骤1.2: Alpha增强因子处理")
+            print("="*80)
+            
+            # 使用Alpha增强因子生成器
+            alpha_generator = EnhancedFactorGenerator(
+                enable_orthogonalization=True,
+                debug=True
+            )
+            
+            # 生成增强因子
+            enhanced_price_data = alpha_generator.generate_all_factors(price_data)
+            
+            # 合并回factor_data
+            # 获取新增的因子列
+            original_cols = set(price_data.columns)
+            enhanced_cols = set(enhanced_price_data.columns)
+            new_factor_cols = enhanced_cols - original_cols
+            
+            print(f"  ✓ 新增因子数量: {len(new_factor_cols)}")
+            print(f"    因子列表: {list(new_factor_cols)[:10]}...")  # 显示前10个
+            
+            # 将新因子合并到factor_data中
+            factor_data = factor_data.merge(
+                enhanced_price_data[['date', 'instrument'] + list(new_factor_cols)],
+                on=['date', 'instrument'],
+                how='left'
+            )
+            
+        except Exception as e:
+            print(f"\n⚠️  Alpha增强因子处理警告: {e}")
+            traceback.print_exc()
+    else:
+        print("\nℹ️  Alpha增强因子模块不可用，跳过此步骤")
+    
     # ============ 步骤1.5: 补全行业数据 ============
     print("\n" + "="*80)
     print("🏭 步骤1.5: 补全行业数据 (用于中性化)")
@@ -726,17 +787,32 @@ def main():
         print("\n" + "="*80)
         print(f"🚀 步骤7: {STRATEGY_VERSION} 回测引擎 (含择时)")
         print("="*80)
-
-        strategy_params = get_strategy_params()
-        strategy_params['rebalance_days'] = REBALANCE_DAYS
-
-        context = run_factor_based_strategy_v2(
-            factor_data=factor_data,
-            price_data=price_data,
-            benchmark_data=benchmark_data,
-            **strategy_params
-        )
-
+        
+        # 【新增】优先使用RSRS择时模块
+        if RSRS_AVAILABLE:
+            print("  ℹ️  使用RSRS择时模块")
+            context = run_rsrs_strategy(
+                factor_data=factor_data,
+                price_data=price_data,
+                benchmark_data=benchmark_data,
+                start_date=START_DATE,
+                end_date=END_DATE,
+                capital_base=CAPITAL_BASE,
+                position_size=POSITION_SIZE,
+                rebalance_days=REBALANCE_DAYS
+            )
+        else:
+            print("  ℹ️  使用标准择时模块")
+            strategy_params = get_strategy_params()
+            strategy_params['rebalance_days'] = REBALANCE_DAYS
+            
+            context = run_factor_based_strategy_v2(
+                factor_data=factor_data,
+                price_data=price_data,
+                benchmark_data=benchmark_data,
+                **strategy_params
+            )
+        
     except Exception as e:
         print(f"\n❌ 回测执行异常: {e}")
         traceback.print_exc()

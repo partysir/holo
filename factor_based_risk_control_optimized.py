@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from collections import defaultdict
+import statsmodels.api as sm
 
 
 class OptimalCashManager:
@@ -275,24 +276,58 @@ class FactorBasedRiskControlOptimized:
         return dict(industry_dict)
 
     def _calculate_market_signals(self):
-        """预计算大盘择时信号"""
+        """
+        升级版：使用 RSRS (阻力支撑相对强度) 进行大盘择时
+        """
         signals = {}
         if self.benchmark_data is None:
             return signals
-
-        df = self.benchmark_data.copy()
-        df = df.sort_values('date')
-        # 计算移动平均线
-        df['ma'] = df['close'].rolling(window=self.market_ma_period).mean()
-
-        # 信号：Close > MA 为看多，否则看空
-        for _, row in df.iterrows():
+        
+        df = self.benchmark_data.copy().sort_values('date')
+        
+        # RSRS 参数
+        N = 18  # 回归周期
+        M = 600 # 均值周期
+        
+        rsrs_values = []
+        
+        # 滚动计算 RSRS 斜率
+        highs = df['high'].values
+        lows = df['low'].values
+        
+        for i in range(len(df)):
+            if i < N:
+                rsrs_values.append(0)
+                continue
+                
+            y = highs[i-N:i]
+            x = lows[i-N:i]
+            x = sm.add_constant(x)
+            
+            model = sm.OLS(y, x)
+            results = model.fit()
+            beta = results.params[1] # 斜率
+            rsrs_values.append(beta)
+            
+        df['rsrs'] = rsrs_values
+        
+        # 标准化 RSRS (RSRS_Z)
+        df['rsrs_mean'] = df['rsrs'].rolling(window=M).mean()
+        df['rsrs_std'] = df['rsrs'].rolling(window=M).std()
+        df['rsrs_z'] = (df['rsrs'] - df['rsrs_mean']) / df['rsrs_std']
+        
+        # 信号生成: RSRS_Z > 0.7 买入, RSRS_Z < -0.7 卖出/风控
+        # 平滑处理：结合右侧趋势
+        for i, row in df.iterrows():
             date_str = str(row['date'])
-            if pd.notna(row['ma']):
-                signals[date_str] = row['close'] > row['ma']
+            z_score = row['rsrs_z']
+            
+            # 激进择时：RSRS分值大于0.7看多，小于-0.7看空，中间震荡
+            if pd.isna(z_score):
+                signals[date_str] = True
             else:
-                signals[date_str] = True # 默认看多
-
+                signals[date_str] = z_score > -0.7 # 只要不是极弱势，都允许做多
+                
         return signals
 
     def check_market_regime(self, date_str):

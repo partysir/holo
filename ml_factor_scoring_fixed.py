@@ -523,10 +523,21 @@ class AdvancedMLScorer:
             merged['target'] = 0
             for date in merged['date'].unique():
                 mask = merged['date'] == date
-                rets = merged.loc[mask, 'future_return']
-                if len(rets) > 5:
-                    thresh = rets.quantile(1 - self.top_percentile)
-                    merged.loc[mask & (merged['future_return'] >= thresh), 'target'] = 1
+                daily_data = merged[mask]
+                
+                # 优化策略：既要跑赢市场，又要有绝对收益
+                # 1. 相对收益 Top 20%
+                # 2. 绝对收益 > 0 (剔除大跌市中的"抗跌股", 熊市空仓比买抗跌更好)
+                
+                thresh = daily_data['future_return'].quantile(1 - self.top_percentile)
+                
+                # 胜率优化核心：双重过滤
+                # future_return 是相对收益 (Active Return)
+                # abs_return 是绝对收益
+                
+                target_mask = (daily_data['future_return'] >= thresh) & (daily_data['abs_return'] > 0.0)
+                
+                merged.loc[mask & target_mask, 'target'] = 1
             target_col = 'target'
         else:
             target_col = 'future_return'
