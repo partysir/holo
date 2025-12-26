@@ -1,20 +1,9 @@
-"""
-data_module_incremental.py - 增量更新模块修复版 v2.3
-
-关键修复：
-✅ 添加 min_days_listed 参数传递
-✅ 在获取股票列表时过滤新股
-✅ 在获取价格数据时过滤上市前数据
-"""
-
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 
-# 导入修复后的数据模块
+# 导入必要的类和函数
 from data_module import (
-    DataCache,
     TushareDataSource,
     StockRankerModel,
     calculate_simple_factors
@@ -34,17 +23,20 @@ def load_data_with_incremental_update(
     use_sampling=True,
     sample_size=100,
     max_workers=4,
-    min_days_listed=180  # ✅ 关键新增参数
+    min_days_listed=180,
+    use_money_flow=True,              # ✅ 新增参数
+    money_flow_style='balanced'       # ✅ 新增参数
 ):
     """
-    增量更新数据加载函数 (修复版 v2.3)
-
+    增量更新数据加载函数 (内存优化版 v2.6)
+    
     新增参数:
-        min_days_listed: 股票最少上市天数，默认180天
+        use_money_flow: 是否启用资金流因子
+        money_flow_style: 资金流风格 'conservative' | 'balanced' | 'aggressive'
     """
-
+    
     print("\n" + "=" * 80)
-    print("📦 增量更新数据加载 (v2.3 - 修复前视偏差)")
+    print("📦 增量更新数据加载 (内存优化版 v2.6)")
     print("=" * 80)
 
     # 显示前视偏差防护配置
@@ -60,15 +52,19 @@ def load_data_with_incremental_update(
     model_type = "StockRanker多因子" if use_stockranker else "简单技术因子"
     if use_stockranker and use_fundamental:
         model_type += " + 基本面"
+    if use_money_flow:  # ✅ 添加资金流标识
+        model_type += " + 资金流"
     print(f"  - 因子模型: {model_type}")
 
     # 生成缓存键（包含版本号和min_days_listed）
     model_suffix = "stockranker" if use_stockranker else "simple"
     if use_fundamental:
         model_suffix += "_fundamental"
-
-    cache_key = f"factor_data_incr_v2.3_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
-    price_cache_key = f"price_data_incr_v2.3_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
+    if use_money_flow:  # ✅ 添加资金流标识到缓存键
+        model_suffix += "_moneyflow"
+        
+    cache_key = f"factor_data_incr_v2.6_{start_date}_{end_date}_{max_stocks}_{model_suffix}_{min_days_listed}"
+    price_cache_key = f"price_data_incr_v2.6_{start_date}_{end_date}_{max_stocks}_{min_days_listed}"
 
     # 尝试从缓存加载
     if not force_full_update and cache_manager:
@@ -234,7 +230,9 @@ def load_data_with_incremental_update(
     if use_stockranker:
         model = StockRankerModel(
             custom_weights=custom_weights,
-            use_fundamental=use_fundamental
+            use_fundamental=use_fundamental,
+            use_money_flow=use_money_flow,        # ✅ 传入参数
+            money_flow_style=money_flow_style     # ✅ 传入参数
         )
         factor_df = model.calculate_all_factors(price_df)
         factor_df = model.calculate_position_score(factor_df)
@@ -242,7 +240,18 @@ def load_data_with_incremental_update(
         print("\n⚙️  计算简单技术因子...")
         factor_df = calculate_simple_factors(price_df)
 
-    factor_df = factor_df.dropna(subset=['position'])
+    # 内存优化：分批处理dropna而不是一次性处理整个DataFrame
+    print("\n🗑️  清理缺失值...")
+    # 先检查position列是否存在
+    if 'position' in factor_df.columns:
+        # 使用更节省内存的方式删除缺失值
+        # 先标记需要删除的行
+        mask = factor_df['position'].notna()
+        print(f"  原始数据: {len(factor_df)} 行")
+        factor_df = factor_df[mask]
+        print(f"  清理后: {len(factor_df)} 行")
+    else:
+        print("  ⚠️  未找到position列，跳过清理")
 
     # ========== 关键修复：保留所有因子列 ==========
     essential_columns = ['date', 'instrument', 'position']
@@ -307,5 +316,8 @@ def load_data_with_incremental_update(
 
     if use_fundamental and use_stockranker:
         print(f"  - 基本面因子: 已启用")
+        
+    if use_money_flow and use_stockranker:  # ✅ 添加资金流提示
+        print(f"  - 资金流因子: 已启用")
 
     return result_factor, result_price

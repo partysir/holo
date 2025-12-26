@@ -226,21 +226,17 @@ def compare_optimizations():
     print("📊 测试1: 基础版 (ml_factor_scoring_fixed)")
     print("="*60)
     try:
-        from ml_factor_scoring_integrated import UltraMLScorer as AdvancedMLScorer
+        from ml_factor_scoring_fixed import AdvancedMLScorer
         scorer_basic = AdvancedMLScorer(
-            target_period=5, top_percentile=0.20,
-            embargo_days=5,
-            neutralize_market=True,
-            neutralize_industry=True,
-            voting_strategy='average',
-            train_months=6
+            model_type='xgboost', target_period=5, top_percentile=0.2,
+            use_ic_features=False, train_months=6
         )
 
-        X, y, merged = scorer_basic.prepare_data(train_data, train_data, factor_cols)
-        scorer_basic.train(X, y, merged, verbose=False)
+        X, y, merged = scorer_basic.prepare_training_data(train_data, train_data, factor_cols)
+        scorer_basic.train_walk_forward(X, y, merged, verbose=False)
 
         # 预测
-        res_basic = scorer_basic.predict(test_data, data) # 传入data作为price_data源
+        res_basic = scorer_basic.predict_scores(test_data, data, factor_cols) # 传入data作为price_data源
 
         results['basic'] = BacktestEvaluator.evaluate_portfolio(
             res_basic, data, 'ml_score', holding_period=5
