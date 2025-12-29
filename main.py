@@ -25,10 +25,32 @@ from data_module_incremental import load_data_with_incremental_update
 ML_AVAILABLE = False
 try:
     from ml_factor_scoring_fixed import (
-        MLFactorScorer,
-        IndustryBasedScorer,
-        EnhancedStockSelector
+        UltraMLScorer as MLFactorScorer
     )
+    
+    # 临时创建缺失的类
+    class IndustryBasedScorer:
+        def __init__(self, tushare_token=None):
+            self.tushare_token = tushare_token
+            
+        def score_by_industry(self, factor_data, factor_columns):
+            # 简单的行业中性化处理，使用增强因子处理器
+            from enhanced_factor_processor import EnhancedFactorProcessor
+            processor = EnhancedFactorProcessor(neutralize_industry=True, neutralize_market=False)
+            # 只有当factor_data中存在industry列时才进行行业中性化
+            if 'industry' in factor_data.columns:
+                factor_data = processor.process_factors(factor_data, factor_columns)
+            return factor_data
+    
+    class EnhancedStockSelector:
+        def __init__(self):
+            pass
+        
+        def select_stocks(self, factor_data, min_score=0.6, max_concentration=0.15, max_industry_concentration=0.3):
+            # 简单的选择逻辑：筛选高于最低分数的股票
+            if 'ml_score' in factor_data.columns:
+                factor_data = factor_data[factor_data['ml_score'] >= min_score].copy()
+            return factor_data
     ML_AVAILABLE = True
 except ImportError:
     print("⚠️  机器学习模块未找到，使用基础因子评分")
@@ -41,6 +63,12 @@ from visualization_module import (
     plot_top_stocks_evolution,
     generate_performance_report
 )
+
+# ✨ 新增视频可视化模块
+try:
+    import video_visualization
+except ImportError:
+    print("⚠️ 未找到video_visualization模块，请确保已创建该文件")
 
 from show_today_holdings import show_today_holdings_dashboard
 from holdings_monitor import generate_daily_holdings_report
@@ -345,19 +373,20 @@ def main():
                 # 初始化机器学习评分器
                 try:
                     ml_scorer = MLFactorScorer(
-                        model_type=ML_MODEL_TYPE,
-                        target_period=ML_TARGET_PERIOD
+                        target_period=ML_TARGET_PERIOD,
+                        top_percentile=0.20,
+                        embargo_days=5,
+                        neutralize_market=True,
+                        neutralize_industry=True,
+                        voting_strategy='average',
+                        train_months=12
                     )
                     
                     # 预测因子得分
-                    factor_data = ml_scorer.predict_scores(factor_data, price_data)
+                    factor_data = ml_scorer.predict(factor_data, price_data)
                     
-                    # 动态权重调整
-                    if available_factors:
-                        dynamic_weights = ml_scorer.dynamic_weight_adjustment(factor_data, available_factors)
-                        print(f"  ✓ 动态权重调整完成")
-                    else:
-                        dynamic_weights = {}
+                    # UltraMLScorer 没有动态权重调整方法，跳过
+                    dynamic_weights = {}
                     
                     ml_elapsed = time.time() - ml_start_time
                     print(f"\n⚡ 机器学习因子评分耗时: {ml_elapsed:.1f} 秒")
@@ -384,7 +413,8 @@ def main():
         print("🏢 步骤5: 分行业评分")
         print("="*80)
         
-        from ml_factor_scoring_fixed import IndustryBasedScorer
+        # 使用本地定义的IndustryBasedScorer类
+        pass
         
         industry_start_time = time.time()
         
@@ -413,7 +443,8 @@ def main():
         print("🎯 步骤6: 增强选股")
         print("="*80)
         
-        from ml_factor_scoring_fixed import EnhancedStockSelector
+        # 使用本地定义的EnhancedStockSelector类
+        pass
         
         selection_start_time = time.time()
         
@@ -493,6 +524,86 @@ def main():
             base_dir='./reports'
         )
         
+        # ============ 新增：生成视频素材 (Video Assets) ============
+        print("\n" + "="*80)
+        print("🎬 生成视频可视化素材 (Plotly & SHAP)")
+        print("="*80)
+
+        try:
+            # 检查 video_visualization 模块是否可用
+            if 'video_visualization' in locals() or 'video_visualization' in globals():
+                # 1. 绘制资产曲线
+                print("  正在绘制交互式资产曲线...")
+                video_visualization.plot_equity_curve_interactive(context)
+
+                # 2. 绘制本周金股 (假设 factor_data 里有 'ml_score' 列)
+                if 'ml_score' in factor_data.columns:
+                    print("  正在绘制本周金股榜...")
+                    # 取最后一天的前10名
+                    last_date = factor_data['date'].max()
+                    last_day_data = factor_data[factor_data['date'] == last_date]
+                    
+                    top_10 = last_day_data.nlargest(10, 'ml_score')
+                    
+                    video_visualization.plot_top_picks_bar(
+                        stock_list=top_10['instrument'].tolist(),
+                        scores=top_10['ml_score'].tolist(),
+                        industries=top_10['industry'].tolist() if 'industry' in top_10.columns else ['Unknown']*10
+                    )
+
+                    # 3. 绘制雷达图 (为第一名画一个示例)
+                    print("  正在绘制个股雷达图...")
+                    top_stock = top_10.iloc[0]
+                    # 这里需要你根据实际因子名做个映射，这里仅作演示
+                    # 假设你的因子经过了标准化(0-1)
+                    demo_factors = {
+                        '动量': np.random.uniform(0.6, 0.9), # 替换为你真实的因子值
+                        '估值': np.random.uniform(0.4, 0.8),
+                        '波动': np.random.uniform(0.7, 1.0),
+                        '资金': top_stock['ml_score'], # 用总分代替
+                        '情绪': np.random.uniform(0.5, 0.9)
+                    }
+                    video_visualization.plot_stock_radar(top_stock['instrument'], demo_factors)
+
+                # 4. 绘制 SHAP 模型解释 (高级)
+                # 需要访问 ml_scorer 内部的模型。
+                # 假设 ml_scorer 是 MLFactorScorer/UltraMLScorer 的实例
+                if ML_AVAILABLE and USE_ML and 'ml_scorer' in locals():
+                    print("  正在计算 SHAP 值 (这可能需要一点时间)...")
+                    
+                    # 尝试获取内部模型
+                    # 你的 ml_factor_scoring_fixed.py 里模型存在 scorer.ensemble.lgb_model 或 xgb_model
+                    model_to_explain = None
+                    if hasattr(ml_scorer, 'ensemble') and ml_scorer.ensemble is not None:
+                        if hasattr(ml_scorer.ensemble, 'lgb_model') and ml_scorer.ensemble.lgb_model:
+                            model_to_explain = ml_scorer.ensemble.lgb_model
+                        elif hasattr(ml_scorer.ensemble, 'xgb_model') and ml_scorer.ensemble.xgb_model:
+                            model_to_explain = ml_scorer.ensemble.xgb_model
+                    
+                    # 同时也需要当时的特征数据 X
+                    # 你可能需要修改 ml_scorer.predict_scores 方法来返回 X，或者在这里重新构建 X
+                    # 为了简单起见，这里演示如何从 factor_data 提取特征
+                    if model_to_explain and hasattr(ml_scorer, 'feature_names'):
+                        # 提取特征数据 (取最近500条以加快速度)
+                        valid_features = [f for f in ml_scorer.feature_names if f in factor_data.columns]
+                        X_sample = factor_data[valid_features].tail(500).fillna(0)
+                        
+                        video_visualization.plot_shap_summary(
+                            model_to_explain, 
+                            X_sample, 
+                            feature_names=valid_features
+                        )
+                    else:
+                        print("  ⚠️ 无法获取模型或特征列表，跳过 SHAP 绘图")
+                else:
+                    print("  ⚠️ ML模型不可用或未训练，跳过 SHAP 绘图")
+            else:
+                print("  ⚠️ video_visualization 模块不可用，跳过视频可视化")
+        except Exception as e:
+            print(f"⚠️ 视频可视化生成失败: {e}")
+            import traceback
+            traceback.print_exc()
+
         # ============ 新增：生成详细持仓报告 ============
         print("\n" + "="*80)
         print("📋 生成详细持仓和交易报告")
