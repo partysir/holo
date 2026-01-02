@@ -1,16 +1,13 @@
 """
-main_fixed.py - 修复评分混乱的主程序
+main_enhanced.py - 整合完整收益指标的增强版主程序
 
-核心修复:
-1. ✅ StockRanker生成 stockranker_score (不覆盖)
-2. ✅ ML生成 ml_score (不覆盖)
-3. ✅ 融合引擎生成最终 position
-4. ✅ 策略使用 position 选股
+新增功能:
+✅ 完整的收益指标报告
+✅ 胜率、盈亏比分析
+✅ 详细交易明细
+✅ 综合评级系统
 
-使用方法:
-1. 将此文件另存为 main_fixed.py
-2. 创建 score_fusion_module.py (见上面的artifact)
-3. 运行: python main_fixed.py
+版本: v3.1
 """
 
 import warnings
@@ -35,14 +32,12 @@ ts.set_token(TUSHARE_TOKEN)
 # ========== 导入核心模块 ==========
 from data_module import DataCache, TushareDataSource
 from data_module_incremental import load_data_with_incremental_update
-
-# ✅ 新增: 导入融合引擎
 from score_fusion_module import ScoreFusionEngine
 
-# ========== ML模块 ==========
+# ✅ 新增：导入收益指标报告模块
+from performance_metrics_report import generate_full_performance_report
 
-# 初始化AdvancedMLScorer为None以避免未定义错误
-AdvancedMLScorer = None
+# ========== ML模块 ==========
 ML_AVAILABLE = False
 if MLConfig.USE_ADVANCED_ML:
     try:
@@ -57,7 +52,7 @@ if MLConfig.USE_ADVANCED_ML:
 
 # ========== 策略引擎 ==========
 from factor_based_risk_control_optimized import run_factor_based_strategy_v2
-STRATEGY_VERSION = "v3.0.1 (Score Fusion Fixed)"
+STRATEGY_VERSION = "v3.1 (Enhanced with Performance Metrics)"
 
 # ========== 报告模块 ==========
 try:
@@ -80,18 +75,11 @@ except ImportError:
 # ==============================================================================
 
 def fix_stockranker_scoring(factor_data):
-    """
-    修复StockRanker评分 - 不覆盖position
-
-    关键: 将原本的position改名为stockranker_score
-    """
+    """修复StockRanker评分"""
     print("\n🔧 修复StockRanker评分流程...")
 
     if 'position' in factor_data.columns:
-        # ✅ 关键修复: position → stockranker_score
         factor_data['stockranker_score'] = factor_data['position']
-
-        # 删除原始position (稍后由融合引擎生成)
         factor_data.drop(columns=['position'], inplace=True)
 
         print(f"  ✓ 已保存StockRanker评分为 stockranker_score")
@@ -104,11 +92,7 @@ def fix_stockranker_scoring(factor_data):
 
 
 def fix_ml_scoring(factor_data, price_data):
-    """
-    修复ML评分 - 不覆盖position
-
-    关键: ML模型只生成ml_score，不生成position
-    """
+    """修复ML评分"""
     if not ML_AVAILABLE:
         print("\n⚠️  跳过ML评分 (模块不可用)")
         return factor_data
@@ -116,31 +100,21 @@ def fix_ml_scoring(factor_data, price_data):
     print("\n🤖 运行ML评分 (修复版)...")
 
     try:
-        # 创建ML评分器
-        if AdvancedMLScorer is None:
-            print("  ⚠️  ML模块未定义，跳过ML评分")
-            return factor_data
-        
         ml_scorer = AdvancedMLScorer(
             target_period=MLConfig.ML_TARGET_PERIOD,
             top_percentile=MLConfig.ML_TOP_PERCENTILE,
-            train_months=MLConfig.ML_TRAIN_MONTHS,
-            neutralize_market=False  # 🔴 关闭市场中性化，允许利用大盘趋势(Beta)
+            train_months=MLConfig.ML_TRAIN_MONTHS
         )
 
-        # 临时保存stockranker_score
         temp_sr_score = None
         if 'stockranker_score' in factor_data.columns:
             temp_sr_score = factor_data['stockranker_score'].copy()
 
-        # 运行ML预测
         factor_data = ml_scorer.predict(factor_data, price_data)
 
-        # ✅ 关键修复: 恢复stockranker_score (防止被覆盖)
         if temp_sr_score is not None:
             factor_data['stockranker_score'] = temp_sr_score
 
-        # ✅ 关键修复: 如果ML覆盖了position，改名为ml_score
         if 'position' in factor_data.columns and 'ml_score' not in factor_data.columns:
             factor_data['ml_score'] = factor_data['position']
             factor_data.drop(columns=['position'], inplace=True)
@@ -164,13 +138,13 @@ def fix_ml_scoring(factor_data, price_data):
 
 def main():
     print("\n" + "="*80)
-    print("    多因子+ML选股回测系统 v3.0.1 (Score Fusion Fixed)")
+    print("    多因子+ML选股回测系统 v3.1 (Enhanced)")
     print("="*80)
-    print("\n🎯 核心修复:")
-    print("  ✅ StockRanker → stockranker_score")
-    print("  ✅ ML → ml_score")
-    print("  ✅ 融合引擎 → position")
-    print("  ✅ 策略使用 position")
+    print("\n🎯 新增功能:")
+    print("  ✅ 完整收益指标报告")
+    print("  ✅ 胜率、盈亏比分析")
+    print("  ✅ 详细交易明细")
+    print("  ✅ 综合策略评级")
     print()
 
     # 配置摘要
@@ -243,39 +217,26 @@ def main():
     except Exception as e:
         print(f"  ⚠️  优化警告: {e}")
 
-    # ========== ✅ 步骤3: 修复StockRanker评分 ==========
+    # ========== 步骤3-5: 评分流程 ==========
     factor_data = fix_stockranker_scoring(factor_data)
-
-    # ========== ✅ 步骤4: 修复ML评分 ==========
     factor_data = fix_ml_scoring(factor_data, price_data)
 
-    # ========== ✅ 步骤5: 融合评分 ==========
     print("\n" + "="*80)
     print("🔗 步骤5: 评分融合")
     print("="*80)
 
-    # 创建融合引擎
     fusion_engine = ScoreFusionEngine(
-        fusion_method='weighted',  # 可选: weighted, rank_average, ml_only, stockranker_only
-        alpha=0.4,  # StockRanker权重
-        beta=0.6    # ML权重
+        fusion_method='weighted',
+        alpha=0.4,
+        beta=0.6
     )
 
-    # 融合评分
     factor_data = fusion_engine.fuse_scores(
         factor_data,
         has_ml=ML_AVAILABLE and 'ml_score' in factor_data.columns
     )
 
-    # 验证
     print(f"\n✅ 评分融合完成!")
-    print(f"  可用评分列:")
-    if 'stockranker_score' in factor_data.columns:
-        print(f"    - stockranker_score: ✓")
-    if 'ml_score' in factor_data.columns:
-        print(f"    - ml_score: ✓")
-    if 'position' in factor_data.columns:
-        print(f"    - position (最终): ✓")
 
     # ========== 步骤6: 运行回测 ==========
     context = None
@@ -299,7 +260,7 @@ def main():
         traceback.print_exc()
         return
 
-    # ========== 步骤7: 生成报告 ==========
+    # ========== 步骤7: 生成报告目录 ==========
     try:
         print(f"\n{'='*80}")
         print("📊 步骤7: 生成报告")
@@ -333,10 +294,28 @@ def main():
         import traceback
         traceback.print_exc()
 
-    # ========== 步骤8: 交易计划 ==========
+    # ========== ✅ 步骤8: 完整收益指标报告 ==========
+    if context:
+        try:
+            print("\n" + "="*80)
+            print("📈 步骤8: 生成完整收益指标报告")
+            print("="*80)
+
+            metrics = generate_full_performance_report(
+                context=context,
+                benchmark_data=benchmark_data,
+                output_dir=date_folder
+            )
+
+        except Exception as e:
+            print(f"⚠️  收益指标报告生成失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ========== 步骤9: 交易计划 ==========
     if context:
         print("\n" + "#"*80)
-        print("📋 步骤8: 今日持仓与交易指令")
+        print("📋 步骤9: 今日持仓与交易指令")
         print("#"*80 + "\n")
 
         df_trades = context.get('trade_records', pd.DataFrame())

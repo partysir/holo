@@ -1,13 +1,14 @@
 """
-factor_based_risk_control_optimized.py - 修复版 v3.0
+factor_based_risk_control_optimized.py - 修复版 v3.1
 修复内容：
 1. ✅ 补全 daily_records 中的字段 ('position_count', 'return', 'holdings_value')
 2. ✅ 保留了之前的空交易处理修复
 3. ✅ 新增交易成本统计功能
 4. ✅ 增强最小持仓天数保护逻辑
 5. ✅ 优化风险模式下的持仓排序算法
+6. ✅ 新增严格选股过滤器：买入前检查评分是否过硬（>0.65），防止买入排名虽然靠前但绝对分很低的烂票
 
-版本：v3.0
+版本：v3.1
 日期：2025-12-29
 """
 
@@ -125,6 +126,9 @@ class FactorBasedRiskControlOptimized:
         self.sell_cost = sell_cost
         self.tax_ratio = tax_ratio
         self.debug = debug
+        
+        # 买入过滤参数
+        self.strict_selection_threshold = 0.65  # 严格选股阈值
 
         self.cash_manager = OptimalCashManager(
             cash_reserve_ratio=cash_reserve_ratio,
@@ -224,6 +228,17 @@ class FactorBasedRiskControlOptimized:
         stock_industry = self.industry_dict.get(date_str, {}).get(stock, 'Unknown')
         industry_weights = self.get_industry_weights(date_str)
         return industry_weights.get(stock_industry, 0) < self.max_industry_weight
+
+    def strict_selection_filter(self, stock, date_str, scores):
+        """✅ 严格选股过滤器：提高胜率的关键"""
+        score = scores.get(stock, 0)
+        
+        # 1. 绝对评分门槛 (防止矮子里拔将军)
+        # 如果大盘不好，所有股票分都低，这时候宁可空仓
+        if score < self.strict_selection_threshold: 
+            return False
+            
+        return True
 
     def check_risk_conditions(self, date):
         """✅ 修复版风控检查 - 增强最小持仓天数保护"""
@@ -376,7 +391,18 @@ class FactorBasedRiskControlOptimized:
                     if scores:
                         # 选股
                         sorted_candidates = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                        top_candidates = [x[0] for x in sorted_candidates[:50]]
+                        
+                        # ✅ 应用严格过滤器
+                        valid_candidates = []
+                        for stock, score in sorted_candidates:
+                            if self.strict_selection_filter(stock, date_str, scores):
+                                valid_candidates.append(stock)
+                        
+                        # 如果合格股票太少，取Top 3兜底，或者直接空仓
+                        if len(valid_candidates) < 3:
+                            top_candidates = [x[0] for x in sorted_candidates[:3]]
+                        else:
+                            top_candidates = valid_candidates[:50]
 
                         target_size = self.position_size
                         if self.is_risk_mode:

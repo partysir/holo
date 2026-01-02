@@ -1,6 +1,6 @@
 """
-data_module.py - 数据管理模块 (完整修复版 v2.6)
-修复 Tushare API 限流问题 + 保留所有原有功能 + 修复列索引错误 + 过滤ST股票
+data_module.py - 数据管理模块 (增强版 v3.1)
+修复 Tushare API 限流问题 + 保留所有原有功能 + 修复列索引错误 + 过滤ST股票 + 加入聪明动量因子
 
 主要改进:
 ✅ 修复 KeyError: "['position', 'amount'] not in index"
@@ -9,6 +9,7 @@ data_module.py - 数据管理模块 (完整修复版 v2.6)
 ✅ 智能限流控制 (自适应等待)
 ✅ 批量请求优化 (减少API调用次数)
 ✅ 新增: 自动过滤 ST/S*ST/*ST 股票
+✅ 新增: 聪明动量因子 (smart_mom_20d) - 收益率/波动率，更稳健的动量指标
 """
 
 import pandas as pd
@@ -192,12 +193,18 @@ class TushareDataSource:
         if not TUSHARE_AVAILABLE:
             raise ImportError("请先安装Tushare: pip install tushare")
 
-        if token:
-            ts.set_token(token)
+        if token and TUSHARE_AVAILABLE:
+            import tushare as ts_module
+            ts_module.set_token(token)
 
         try:
-            self.pro = ts.pro_api()
-            print("✓ Tushare API初始化成功")
+            if TUSHARE_AVAILABLE:
+                import tushare as ts_module
+                self.pro = ts_module.pro_api()
+                print("✓ Tushare API初始化成功")
+            else:
+                self.pro = None
+                print("⚠️ Tushare未安装")
         except Exception as e:
             print(f"✗ Tushare初始化失败: {e}")
             print("请设置token: ts.set_token('你的token')")
@@ -240,13 +247,13 @@ class TushareDataSource:
             # ========== 关键修复: 过滤 ST 股票 ==========
             if 'name' in df.columns:
                 original_count = len(df)
-                df = df[~df['name'].str.contains('ST', case=False, na=False)].copy()
+                df = df[~df['name'].astype(str).str.contains('ST', case=False, na=False)].copy()
                 st_filtered = original_count - len(df)
                 print(f"  🗑️ ST股票过滤: 剔除 {st_filtered} 只风险警示股")
 
             # 过滤特殊板块
             original_count = len(df)
-            df = df[~df['symbol'].str.startswith(('688', '300', '8', '4', '92'))].copy()
+            df = df[~df['symbol'].astype(str).str.startswith(('688', '300', '8', '4', '92'))].copy()
             special_filtered = original_count - len(df)
 
             if special_filtered > 0:
@@ -458,7 +465,7 @@ class TushareDataSource:
                 self.cache.save_to_cache(stock_basic_cache[['instrument', 'industry']], cache_name)
 
             stock_basic = stock_basic[stock_basic['ts_code'].isin(instruments)]
-            stock_basic = stock_basic.rename(columns={'ts_code': 'instrument'})
+            stock_basic = stock_basic.rename(columns={'ts_code': 'instrument'}).copy()
             stock_basic['industry'] = stock_basic['industry'].fillna('其他')
             result = stock_basic[['instrument', 'industry']]
 
@@ -580,6 +587,8 @@ class StockRankerModel:
                     
                     # 动量（权重从15%降到12%）
                     'return_20d': 0.06, 'return_60d': 0.06,
+                    # 聪明动量（高权重）
+                    'smart_mom_20d': 0.15,
                     
                     # 基本面（权重从30%降到25%）
                     'roe': 0.08, 'roa': 0.04,
@@ -596,6 +605,7 @@ class StockRankerModel:
                     'volatility_20d': -0.08, 'volatility_60d': -0.07,
                     'money_flow_20d': 0.08, 'volume_ratio': 0.07,
                     'return_20d': 0.08, 'return_60d': 0.07,
+                    'smart_mom_20d': 0.15,  # 聪明动量高权重
                     'roe': 0.10, 'roa': 0.05,
                     'gross_margin': 0.05, 'net_margin': 0.05,
                     'debt_ratio': -0.05
@@ -608,6 +618,7 @@ class StockRankerModel:
                     'volatility_20d': -0.08, 'volatility_60d': -0.07,
                     'money_flow_20d': 0.06, 'volume_ratio': 0.06,
                     'return_20d': 0.08, 'return_60d': 0.07,
+                    'smart_mom_20d': 0.15,  # 聪明动量高权重
                 }
                 base_weights.update(money_flow_weights)
                 
@@ -617,7 +628,8 @@ class StockRankerModel:
                     'pe_ratio': -0.15, 'pb_ratio': -0.15, 'ps_ratio': -0.10,
                     'volatility_20d': -0.10, 'volatility_60d': -0.10,
                     'money_flow_20d': 0.10, 'volume_ratio': 0.10,
-                    'return_20d': 0.10, 'return_60d': 0.10
+                    'return_20d': 0.10, 'return_60d': 0.10,
+                    'smart_mom_20d': 0.15  # 聪明动量高权重
                 }
             
             self.factor_weights = base_weights
@@ -650,6 +662,10 @@ class StockRankerModel:
     def calculate_momentum_factors(self, df):
         df['return_20d'] = df.groupby('instrument')['close'].pct_change(20)
         df['return_60d'] = df.groupby('instrument')['close'].pct_change(60)
+        
+        # ✅ 聪明动量因子 (Sharpe-like Momentum): 收益/波动率，惩罚剧烈波动的上涨
+        volatility_20d = df.groupby('instrument')['close'].rolling(20).std().reset_index(0, drop=True)
+        df['smart_mom_20d'] = df['return_20d'] / (volatility_20d + 1e-6)
         return df
 
     def process_fundamental_factors(self, df):
@@ -810,7 +826,10 @@ def load_data_from_tushare(
     stock_list = stock_list[:max_stocks]
 
     # 获取股票上市信息
-    stock_info_df = data_source.pro.stock_basic(exchange='', list_status='L', fields='ts_code,list_date')
+    if data_source.pro:
+        stock_info_df = data_source.pro.stock_basic(exchange='', list_status='L', fields='ts_code,list_date')
+    else:
+        stock_info_df = pd.DataFrame(columns=['ts_code', 'list_date'])
     stock_info_dict = dict(zip(stock_info_df['ts_code'], stock_info_df['list_date']))
 
     # 4. 获取价格数据

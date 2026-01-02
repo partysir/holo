@@ -1,11 +1,12 @@
 """
-ml_factor_scoring_fixed.py - 滚动训练修复版 v2.8 (消除评分重复)
+ml_factor_scoring_fixed.py - 滚动训练修复版 v2.9 (ML评分归一化修复)
 
 修复内容：
 1. ✅ 消除与StockRanker的评分重复问题
 2. ✅ ML模型使用原始因子，而非预计算的position
 3. ✅ 清晰的评分流程：原始因子 → ML预测 → 最终评分
-4. ✅ 保留所有原有功能（滚动窗口、数据隔离等）
+4. ✅ 统一ML评分归一化到 [0, 1] 范围
+5. ✅ 保留所有原有功能（滚动窗口、数据隔离等）
 """
 
 import pandas as pd
@@ -30,7 +31,7 @@ except ImportError:
     lgb = None
     LIGHTGBM_AVAILABLE = False
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import LinearRegression
 
@@ -215,11 +216,11 @@ class EnsembleVotingScorer:
 
 
 # ============================================================================
-# UltraMLScorer (核心类) - v2.8 修复评分重复
+# UltraMLScorer (核心类) - v2.9 修复ML评分归一化
 # ============================================================================
 
 class UltraMLScorer:
-    """超级ML评分器 - 滚动训练版 (v2.8 消除评分重复)"""
+    """超级ML评分器 - 滚动训练版 (v2.9 修复ML评分归一化)"""
     def __init__(self, target_period=5, top_percentile=0.2, embargo_days=5,
                  neutralize_market=True, neutralize_industry=True,
                  voting_strategy='average', train_months=12, **kwargs):
@@ -233,10 +234,11 @@ class UltraMLScorer:
         self.ensemble = None
         self.feature_names = None
 
-        print(f"\n🚀 UltraMLScorer v2.8 (修复评分重复)")
+        print(f"\n🚀 UltraMLScorer v2.9 (ML评分归一化修复)")
         print(f"  ✅ 预测周期: {target_period}天")
         print(f"  ✅ 滚动训练窗口: {train_months}个月")
         print(f"  ✅ 使用原始因子训练，避免position泄露")
+        print(f"  ✅ ML评分统一归一化到 [0, 1]")
 
     def _identify_factor_columns(self, factor_data):
         """
@@ -363,11 +365,12 @@ class UltraMLScorer:
 
     def predict(self, factor_data, price_data=None):
         """
-        执行滚动预测 (Rolling Prediction) - v2.8 修复版
+        执行滚动预测 (Rolling Prediction) - v2.9 修复版
 
-        ✅ 关键修复：使用原始因子列，避免使用预计算的position
+        ✅ 关键修复1：使用原始因子列，避免使用预计算的position
+        ✅ 关键修复2：统一ML评分归一化到 [0, 1]
         """
-        print(f"\n🎯 开始滚动窗口预测 (v2.8 - 修复评分重复)...")
+        print(f"\n🎯 开始滚动窗口预测 (v2.9 - 统一归一化)...")
 
         # 1. 准备基础数据
         factor_data = factor_data.sort_values('date').copy()
@@ -384,7 +387,11 @@ class UltraMLScorer:
             numeric_cols = [c for c in numeric_cols if c not in ['date', 'position', 'ml_score']]
             if len(numeric_cols) > 0:
                 scaler = StandardScaler()
-                factor_data['ml_score'] = scaler.fit_transform(factor_data[numeric_cols].fillna(0)).mean(axis=1)
+                raw_scores = scaler.fit_transform(factor_data[numeric_cols].fillna(0)).mean(axis=1)
+
+                # ✅ 归一化到 [0, 1]
+                normalizer = MinMaxScaler()
+                factor_data['ml_score'] = normalizer.fit_transform(raw_scores.reshape(-1, 1)).flatten()
                 factor_data['position'] = factor_data.groupby('date')['ml_score'].rank(pct=True)
             return factor_data
 
@@ -424,11 +431,17 @@ class UltraMLScorer:
             train_start = current_date - train_window
 
             if train_start < start_date:
-                # === 冷启动模式 ===
+                # === 冷启动模式 - 添加归一化 ===
                 X = batch_data[factor_columns].fillna(0)
                 scaler = StandardScaler()
                 X_scaled = scaler.fit_transform(X)
-                batch_data['ml_score'] = X_scaled.mean(axis=1)
+                raw_scores = X_scaled.mean(axis=1)
+
+                # ✅ 关键修复：归一化到 [0, 1]
+                normalizer = MinMaxScaler()
+                batch_data['ml_score'] = normalizer.fit_transform(
+                    raw_scores.reshape(-1, 1)
+                ).flatten()
 
             else:
                 # === 滚动训练模式 ===
@@ -444,13 +457,19 @@ class UltraMLScorer:
                     self.ensemble = model
 
                     X_pred, _ = self.prepare_batch_data(batch_data, price_data, factor_columns, is_inference=True)
-                    batch_data['ml_score'] = model.predict_proba(X_pred)
+                    batch_data['ml_score'] = model.predict_proba(X_pred)  # 已经是 [0, 1]
 
                 except Exception as e:
                     print(f"    ⚠️ 训练失败 ({e})，降级为规则打分")
                     X = batch_data[factor_columns].fillna(0)
                     scaler = StandardScaler()
-                    batch_data['ml_score'] = scaler.fit_transform(X).mean(axis=1)
+                    raw_scores = scaler.fit_transform(X).mean(axis=1)
+
+                    # ✅ 关键修复：降级模式也要归一化
+                    normalizer = MinMaxScaler()
+                    batch_data['ml_score'] = normalizer.fit_transform(
+                        raw_scores.reshape(-1, 1)
+                    ).flatten()
 
             results.append(batch_data)
             current_date = next_date
@@ -460,9 +479,19 @@ class UltraMLScorer:
             return factor_data
 
         final_result = pd.concat(results)
+
+        # ✅ 最终保险：全局归一化确保所有数据在 [0, 1]
+        final_normalizer = MinMaxScaler()
+        final_result['ml_score'] = final_normalizer.fit_transform(
+            final_result['ml_score'].values.reshape(-1, 1)
+        ).flatten()
+
+        # position 保持为百分位排名
         final_result['position'] = final_result.groupby('date')['ml_score'].rank(pct=True)
 
         print(f"  ✅ 滚动预测完成，生成了 {len(final_result)} 条评分")
+        print(f"  📊 ML评分范围: [{final_result['ml_score'].min():.4f}, {final_result['ml_score'].max():.4f}]")
+
         return final_result
 
     def _detect_price_column(self, df):

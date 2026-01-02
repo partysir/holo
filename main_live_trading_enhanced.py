@@ -1,26 +1,24 @@
 """
-main_live_trading_enhanced.py - 实盘交易增强版 (集成滚动训练ML)
+main_live_trading_enhanced.py - 完整增强版实盘交易系统 v3.1
 
-核心升级:
-✅ 集成滚动训练ML模型（UltraMLScorer）
-✅ 使用最新12个月数据训练
-✅ 保持原有交易逻辑和风控
-✅ 支持模型缓存加速
-✅ 生成可解释的选股报告
+核心功能:
+1. 评分融合 (StockRanker + ML)
+2. 今日股票推荐（Top 10）
+3. 详细推荐报告
+4. 持仓分析
+5. 风险提示
 
-配置:
-- 5日调仓-等权（基础胜率 53.24%）
-- ML增强选股（预期提升至 60%+）
-- 每日检查但不一定交易
-- 生成持仓建议CSV
-- 支持国信证券接口
+修复内容 (v3.1):
+- ✅ 修复技术指标计算：使用 price_data 而非 factor_data
+- ✅ 修复5日回报率计算逻辑
+- ✅ 增加数据验证和异常值检测
+- ✅ 增强日志输出
 
-版本: v2.6
-日期: 2025-12-27
+版本: v3.1
+日期: 2025-12-30
 """
 
 import warnings
-
 warnings.filterwarnings('ignore')
 
 import pandas as pd
@@ -28,634 +26,714 @@ import numpy as np
 from datetime import datetime, timedelta
 import os
 import json
-import time
-import pickle
-
 import tushare as ts
 
+# ========== 配置 ==========
 TUSHARE_TOKEN = "2876ea85cb005fb5fa17c809a98174f2d5aae8b1f830110a5ead6211"
 ts.set_token(TUSHARE_TOKEN)
 
-from data_module import DataCache, TushareDataSource
+from data_module import DataCache
 from data_module_incremental import load_data_with_incremental_update
+from score_fusion_module import ScoreFusionEngine
 
-# ========== 导入ML模块 ==========
+# ML模块
+ML_AVAILABLE = False
 try:
-    from ml_factor_scoring_fixed import UltraMLScorer
-
+    from ml_factor_scoring_fixed_v29 import UltraMLScorer as AdvancedMLScorer
     ML_AVAILABLE = True
-    print("✓ 滚动训练ML模块加载成功")
-except ImportError as e:
-    print(f"⚠️  ML模块未找到: {e}")
-    ML_AVAILABLE = False
+    print("✅ ML module available (v2.9)")
+except ImportError:
+    try:
+        from ml_factor_scoring_fixed import UltraMLScorer as AdvancedMLScorer
+        ML_AVAILABLE = True
+        print("✅ ML module available")
+    except ImportError:
+        print("⚠️  ML module not available")
 
 
-# ========== 实盘配置 ==========
+# ========== 配置类 ==========
 class LiveTradingConfig:
     """实盘交易配置"""
 
-    # 策略参数（根据回测最优结果）
-    REBALANCE_DAYS = 5  # ✨ 5日调仓
-    POSITION_METHOD = 'equal'  # ✨ 等权
-    POSITION_SIZE = 10  # 持仓10只
+    REBALANCE_DAYS = 5
+    POSITION_SIZE = 10
+    RECOMMEND_TOP_N = 10  # 推荐前10只
+    RECOMMEND_MIN_SCORE = 0.6  # 最低推荐分数
 
-    # 风控参数
-    STOP_LOSS = -0.15  # 止损-15%
-    SCORE_THRESHOLD = 0.15  # 换仓阈值
-    FORCE_REPLACE_DAYS = 45  # 强制评估周期
-
-    # 交易成本
-    BUY_COST = 0.0003
-    SELL_COST = 0.0003
-    TAX_RATIO = 0.0005
+    # 评分融合
+    USE_ML = True
+    FUSION_METHOD = 'weighted'
+    FUSION_ALPHA = 0.4
+    FUSION_BETA = 0.6
 
     # 数据配置
-    USE_SAMPLING = False
     SAMPLE_SIZE = 3950
 
-    # ML配置
-    USE_ML_SCORING = True  # ✨ 启用ML评分
-    ML_TRAIN_MONTHS = 12  # 训练窗口（月）
-    ML_CACHE_MODELS = True  # 缓存训练好的模型
-
     # 实盘控制
-    ENABLE_AUTO_TRADE = False  # ✨ 是否启用自动交易（默认关闭，仅生成建议）
+    ENABLE_AUTO_TRADE = False
 
-    # 国信证券配置
-    GUOSEN_CONFIG = {
-        'broker': 'guosen',
-        'account': '',
-        'password': '',
-        'comm_password': '',
-        'ip': '',
-        'port': 0,
-    }
 
+# ========== 评分处理 ==========
+
+def fix_stockranker_scoring(factor_data):
+    if 'position' in factor_data.columns:
+        factor_data['stockranker_score'] = factor_data['position']
+        factor_data.drop(columns=['position'], inplace=True)
+    return factor_data
+
+
+def fix_ml_scoring(factor_data, price_data):
+    if not LiveTradingConfig.USE_ML or not ML_AVAILABLE:
+        return factor_data
+
+    print("\nRunning ML scoring...")
+
+    try:
+        ml_scorer = AdvancedMLScorer(
+            target_period=5,
+            top_percentile=0.2,
+            train_months=12
+        )
+
+        temp_sr = None
+        if 'stockranker_score' in factor_data.columns:
+            temp_sr = factor_data['stockranker_score'].copy()
+
+        factor_data = ml_scorer.predict(factor_data, price_data)
+
+        if temp_sr is not None:
+            factor_data['stockranker_score'] = temp_sr
+
+        if 'position' in factor_data.columns and 'ml_score' not in factor_data.columns:
+            factor_data['ml_score'] = factor_data['position']
+            factor_data.drop(columns=['position'], inplace=True)
+
+        print("ML scoring completed")
+
+    except Exception as e:
+        print(f"ML scoring failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return factor_data
+
+
+def fuse_scores(factor_data):
+    print("\nFusing scores...")
+
+    fusion_engine = ScoreFusionEngine(
+        fusion_method=LiveTradingConfig.FUSION_METHOD,
+        alpha=LiveTradingConfig.FUSION_ALPHA,
+        beta=LiveTradingConfig.FUSION_BETA
+    )
+
+    has_ml = 'ml_score' in factor_data.columns
+    factor_data = fusion_engine.fuse_scores(factor_data, has_ml=has_ml)
+
+    return factor_data
+
+
+# ========== 推荐生成 ==========
+
+def generate_recommendations(factor_data, price_data, state):
+    """生成今日推荐 - v3.1 增强版"""
+    print("\n" + "="*80)
+    print("Generating Today's Stock Recommendations")
+    print("="*80)
+
+    # ✅ 数据验证
+    print(f"\n📊 数据概况:")
+    print(f"  Factor Data: {len(factor_data)} 行, {len(factor_data['instrument'].unique())} 只股票")
+    print(f"  Price Data:  {len(price_data)} 行, {len(price_data['instrument'].unique())} 只股票")
+    print(f"  最新日期:    {price_data['date'].max()}")
+
+    # ✅ 检查ML评分范围
+    if 'ml_score' in factor_data.columns:
+        ml_min, ml_max = factor_data['ml_score'].min(), factor_data['ml_score'].max()
+        print(f"  ML Score范围: [{ml_min:.4f}, {ml_max:.4f}]")
+
+        if ml_max > 1.5:
+            print(f"  ⚠️ 警告: ML评分超过正常范围，可能需要检查归一化")
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # 获取今日数据
+    today_factors = factor_data[factor_data['date'] == today]
+
+    if len(today_factors) == 0:
+        latest_date = factor_data['date'].max()
+        today_factors = factor_data[factor_data['date'] == latest_date]
+        print(f"Using latest data: {latest_date}")
+        today = latest_date
+
+    # 筛选高分股票
+    high_score = today_factors[
+        today_factors['position'] >= LiveTradingConfig.RECOMMEND_MIN_SCORE
+    ].copy()
+
+    # 排序
+    high_score = high_score.sort_values('position', ascending=False)
+
+    # 取Top N
+    recommendations = high_score.head(LiveTradingConfig.RECOMMEND_TOP_N).copy()
+
+    # 获取价格
+    today_prices = price_data[price_data['date'] == today]
+
+    # 增强信息
+    recommendations = enhance_recommendations(recommendations, today_prices, price_data, factor_data, state)
+
+    print(f"\n✅ Generated {len(recommendations)} recommendations")
+
+    return recommendations
+
+
+def enhance_recommendations(recommendations, today_prices, price_data, factor_data, state):
+    """
+    增强推荐信息 - v3.1 修复版
+
+    ✅ 关键修复：使用 price_data 计算技术指标，而非 factor_data
+    """
+
+    # 1. 添加当前价格（从 today_prices）
+    recommendations = recommendations.merge(
+        today_prices[['instrument', 'close', 'volume', 'amount']],
+        on='instrument',
+        how='left',
+        suffixes=('', '_price')
+    )
+
+    # 2. 计算技术指标（✅ 使用 price_data 而非 factor_data）
+    print("  📊 计算技术指标...")
+
+    for idx, row in recommendations.iterrows():
+        stock = row['instrument']
+
+        # ✅ 从 price_data 获取历史价格
+        hist = price_data[
+            price_data['instrument'] == stock
+        ].sort_values('date').tail(30)  # 取最近30天
+
+        if len(hist) >= 6:
+            # 计算5日回报率
+            try:
+                price_5d_ago = hist['close'].iloc[-6]
+                price_now = hist['close'].iloc[-1]
+
+                if price_5d_ago > 0:
+                    returns_5d = (price_now / price_5d_ago - 1)
+                else:
+                    returns_5d = 0
+
+                recommendations.at[idx, 'return_5d'] = returns_5d
+
+            except Exception as e:
+                recommendations.at[idx, 'return_5d'] = 0
+                print(f"    ⚠️ {stock}: 5日回报率计算失败 ({e})")
+        else:
+            recommendations.at[idx, 'return_5d'] = 0
+            print(f"    ⚠️ {stock}: 历史数据不足 ({len(hist)} 天)")
+
+        if len(hist) >= 20:
+            # 计算20日波动率
+            try:
+                vol = hist['close'].pct_change().std()
+                recommendations.at[idx, 'volatility_20d'] = vol
+            except:
+                recommendations.at[idx, 'volatility_20d'] = 0
+        else:
+            recommendations.at[idx, 'volatility_20d'] = 0
+
+    # 3. 推荐等级
+    recommendations['recommend_level'] = pd.cut(
+        recommendations['position'],
+        bins=[0, 0.7, 0.8, 0.9, 1.0],
+        labels=['Hold', 'Accumulate', 'Buy', 'Strong Buy']
+    )
+
+    # 4. 持仓状态
+    current_positions = state.get('positions', {})
+    recommendations['in_portfolio'] = recommendations['instrument'].apply(
+        lambda x: 'Yes' if x in current_positions else 'No'
+    )
+
+    # 5. 风险等级
+    recommendations['risk_level'] = recommendations.apply(
+        lambda row: classify_risk(row), axis=1
+    )
+
+    # ✅ 数据质量报告
+    print(f"\n  📋 技术指标质量:")
+    valid_returns = (recommendations['return_5d'] != 0).sum()
+    valid_vol = (recommendations['volatility_20d'] != 0).sum()
+    print(f"    有效5日回报率: {valid_returns}/{len(recommendations)}")
+    print(f"    有效波动率: {valid_vol}/{len(recommendations)}")
+
+    return recommendations
+
+
+def classify_risk(row):
+    """分类风险"""
+    vol = row.get('volatility_20d', 0)
+
+    if vol < 0.02:
+        return 'Low'
+    elif vol < 0.04:
+        return 'Medium'
+    else:
+        return 'High'
+
+
+# ========== 报告生成 ==========
+
+def generate_report(recommendations, output_dir='./live_trading'):
+    """生成推荐报告 (Top 10)"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    today = datetime.now().strftime('%Y%m%d')
+    report_path = os.path.join(output_dir, f'stock_recommendations_{today}.txt')
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        # 标题
+        f.write("="*90 + "\n")
+        f.write("          TODAY'S TOP 10 STOCK RECOMMENDATIONS\n")
+        f.write("="*90 + "\n\n")
+
+        # 信息
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Strategy: {LiveTradingConfig.FUSION_METHOD}")
+        if LiveTradingConfig.FUSION_METHOD == 'weighted':
+            f.write(f" (SR:{LiveTradingConfig.FUSION_ALPHA:.0%} + ML:{LiveTradingConfig.FUSION_BETA:.0%})")
+        f.write("\n\n")
+
+        # 摘要
+        f.write("-"*90 + "\n")
+        f.write("SUMMARY\n")
+        f.write("-"*90 + "\n\n")
+
+        level_counts = recommendations['recommend_level'].value_counts()
+        f.write("Recommendation Levels: ")
+        f.write(" | ".join([f"{level}({count})" for level, count in level_counts.items()]))
+        f.write("\n")
+
+        if 'industry' in recommendations.columns:
+            f.write("\nTop Industries:\n")
+            industry_counts = recommendations['industry'].value_counts().head(5)
+            for industry, count in industry_counts.items():
+                f.write(f"  {industry}: {count}\n")
+
+        # 详细列表
+        f.write("\n\n" + "-"*90 + "\n")
+        f.write(f"{'#':<3} {'Code':<12} {'Level':<13} {'Score':<8} {'SR':<8} {'ML':<8} {'Price':<10} {'5D%':<11} {'Risk':<8}\n")
+        f.write("-"*90 + "\n")
+
+        for i, (_, row) in enumerate(recommendations.iterrows(), 1):
+            level = str(row.get('recommend_level', 'N/A'))[:12]
+            score = row.get('position', 0)
+            sr_score = row.get('stockranker_score', 0)
+            ml_score = row.get('ml_score', 0)
+            price = row.get('close', 0)
+            ret5d = row.get('return_5d', 0)
+            risk = row.get('risk_level', 'N/A')
+
+            # 趋势图标
+            if ret5d > 0.03:
+                icon = "+++"
+            elif ret5d > 0:
+                icon = "+"
+            elif ret5d < -0.03:
+                icon = "---"
+            elif ret5d < 0:
+                icon = "-"
+            else:
+                icon = "="
+
+            # 星级
+            if score >= 0.9:
+                stars = "***"
+            elif score >= 0.8:
+                stars = "**"
+            elif score >= 0.7:
+                stars = "*"
+            else:
+                stars = ""
+
+            f.write(f"{i:<3} {row['instrument']:<12} {level:<13} {score:<8.4f} {sr_score:<8.4f} "
+                   f"{ml_score:<8.4f} ${price:<9.2f} {icon}{ret5d:<10.2%} {risk:<8} {stars}\n")
+
+        f.write("-"*90 + "\n")
+
+        # 重点推荐
+        f.write("\n\n*** FOCUS ON TOP 3 ***\n\n")
+        for i, (_, row) in enumerate(recommendations.head(3).iterrows(), 1):
+            f.write(f"{i}. {row['instrument']} - {row.get('recommend_level', 'N/A')}\n")
+            f.write(f"   Final Score: {row['position']:.4f}\n")
+
+            if pd.notna(row.get('stockranker_score')):
+                f.write(f"   - Multi-Factor: {row['stockranker_score']:.4f}\n")
+
+            if pd.notna(row.get('ml_score')):
+                f.write(f"   - ML Prediction: {row['ml_score']:.4f}\n")
+
+            if pd.notna(row.get('close')):
+                f.write(f"   - Current Price: ${row['close']:.2f}\n")
+
+            if pd.notna(row.get('return_5d')):
+                ret = row['return_5d']
+                if ret > 0.03:
+                    trend = "Strong Uptrend"
+                elif ret > 0:
+                    trend = "Uptrend"
+                elif ret > -0.01:
+                    trend = "Sideways"
+                else:
+                    trend = "Downtrend"
+                f.write(f"   - 5-Day Momentum: {ret:+.2%} ({trend})\n")
+
+            if 'industry' in row and pd.notna(row['industry']):
+                f.write(f"   - Sector: {row['industry']}\n")
+
+            f.write("\n")
+
+        # 风险提示
+        f.write("\n" + "="*90 + "\n")
+        f.write("RISK DISCLAIMER\n")
+        f.write("="*90 + "\n\n")
+        f.write("1. This report is generated by quantitative models for reference only\n")
+        f.write("2. Not financial advice - please do your own research\n")
+        f.write("3. Stock market involves significant risks\n")
+        f.write("4. Past performance does not guarantee future results\n")
+        f.write("5. Invest according to your risk tolerance\n")
+        f.write("6. Diversification is recommended\n\n")
+
+        f.write("This system combines multi-factor analysis with machine learning\n")
+        f.write("to identify stocks with strong potential. However, all investments\n")
+        f.write("carry risk and should be made with caution.\n")
+
+    print(f"\nReport saved: {report_path}")
+
+    return report_path
+
+
+def print_recommendations(recommendations):
+    """打印推荐到终端 (Top 10)"""
+    print("\n" + "="*90)
+    print("          TODAY'S TOP 10 STOCK RECOMMENDATIONS")
+    print("="*90)
+
+    print(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Strategy: {LiveTradingConfig.FUSION_METHOD} (SR:{LiveTradingConfig.FUSION_ALPHA:.0%} + ML:{LiveTradingConfig.FUSION_BETA:.0%})")
+
+    # 等级分布
+    if 'recommend_level' in recommendations.columns:
+        level_counts = recommendations['recommend_level'].value_counts()
+        print(f"\nRecommendation Levels: ", end="")
+        print(" | ".join([f"{level}({count})" for level, count in level_counts.items()]))
+
+    # 详细列表
+    print("\n" + "-"*90)
+    print(f"{'#':<3} {'Code':<12} {'Level':<12} {'Score':<8} {'SR':<8} {'ML':<8} {'Price':<10} {'5D%':<10} {'Risk':<8}")
+    print("-"*90)
+
+    for i, (_, row) in enumerate(recommendations.iterrows(), 1):
+        level = str(row.get('recommend_level', 'N/A'))[:11]
+        score = row.get('position', 0)
+        sr_score = row.get('stockranker_score', 0)
+        ml_score = row.get('ml_score', 0)
+        price = row.get('close', 0)
+        ret5d = row.get('return_5d', 0)
+        risk = row.get('risk_level', 'N/A')
+
+        # 图标
+        if ret5d > 0.03:
+            icon = "+++"
+        elif ret5d > 0:
+            icon = "+"
+        elif ret5d < -0.03:
+            icon = "---"
+        elif ret5d < 0:
+            icon = "-"
+        else:
+            icon = "="
+
+        # 星级（根据评分）
+        if score >= 0.9:
+            stars = "***"
+        elif score >= 0.8:
+            stars = "**"
+        elif score >= 0.7:
+            stars = "*"
+        else:
+            stars = ""
+
+        print(f"{i:<3} {row['instrument']:<12} {level:<12} {score:<8.4f} {sr_score:<8.4f} "
+              f"{ml_score:<8.4f} ${price:<9.2f} {icon}{ret5d:<9.2%} {risk:<8} {stars}")
+
+    print("-"*90)
+
+    # 重点推荐 (Top 3)
+    print("\n*** FOCUS ON TOP 3 ***\n")
+    for i, (_, row) in enumerate(recommendations.head(3).iterrows(), 1):
+        print(f"{i}. {row['instrument']} - {row.get('recommend_level', 'N/A')}")
+        print(f"   Final Score: {row['position']:.4f}")
+
+        if pd.notna(row.get('stockranker_score')):
+            print(f"   - Multi-Factor: {row['stockranker_score']:.4f}")
+
+        if pd.notna(row.get('ml_score')):
+            print(f"   - ML Prediction: {row['ml_score']:.4f}")
+
+        if pd.notna(row.get('close')):
+            print(f"   - Current Price: ${row['close']:.2f}")
+
+        if pd.notna(row.get('return_5d')):
+            momentum = "Strong Uptrend" if row['return_5d'] > 0.03 else "Uptrend" if row['return_5d'] > 0 else "Downtrend"
+            print(f"   - 5-Day Momentum: {row['return_5d']:+.2%} ({momentum})")
+
+        if 'industry' in row and pd.notna(row['industry']):
+            print(f"   - Sector: {row['industry']}")
+
+        print()
+
+
+def save_recommendations_csv(recommendations, output_dir='./live_trading'):
+    """保存CSV"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    today = datetime.now().strftime('%Y%m%d')
+    csv_path = os.path.join(output_dir, f'stock_recommendations_{today}.csv')
+
+    cols = [
+        'instrument', 'position', 'recommend_level', 'close',
+        'return_5d', 'volatility_20d', 'risk_level', 'in_portfolio'
+    ]
+
+    if 'stockranker_score' in recommendations.columns:
+        cols.insert(2, 'stockranker_score')
+
+    if 'ml_score' in recommendations.columns:
+        cols.insert(3, 'ml_score')
+
+    if 'industry' in recommendations.columns:
+        cols.append('industry')
+
+    cols = [c for c in cols if c in recommendations.columns]
+
+    recommendations[cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
+
+    print(f"CSV saved: {csv_path}")
+
+    return csv_path
+
+
+# ========== 交易功能 ==========
 
 def check_trading_day():
-    """检查是否是交易日"""
     try:
         pro = ts.pro_api()
         today = datetime.now().strftime('%Y%m%d')
-
-        cal = pro.trade_cal(
-            exchange='SSE',
-            start_date=today,
-            end_date=today
-        )
-
+        cal = pro.trade_cal(exchange='SSE', start_date=today, end_date=today)
         if len(cal) == 0:
             return False
-
         return cal.iloc[0]['is_open'] == 1
-    except Exception as e:
-        print(f"⚠️  交易日检查失败: {e}")
+    except:
         return True
 
 
-def load_historical_state():
-    """加载历史状态"""
+def load_state():
     state_file = './live_trading_state.json'
-
     if os.path.exists(state_file):
         try:
-            with open(state_file, 'r', encoding='utf-8') as f:
+            with open(state_file, 'r') as f:
                 return json.load(f)
         except:
             pass
-
-    return {
-        'last_rebalance_date': None,
-        'last_ml_train_date': None,  # ✨ 新增：记录上次ML训练时间
-        'positions': {},
-        'rebalance_history': []
-    }
+    return {'last_rebalance_date': None, 'positions': {}}
 
 
-def save_current_state(state):
-    """保存当前状态"""
-    with open('./live_trading_state.json', 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+def save_state(state):
+    with open('./live_trading_state.json', 'w') as f:
+        json.dump(state, f, indent=2)
 
 
 def should_rebalance(state):
-    """判断是否应该调仓"""
     last_date = state.get('last_rebalance_date')
-
-    if last_date is None:
-        return True, "首次运行"
+    if not last_date:
+        return True, "First run"
 
     last_dt = datetime.strptime(last_date, '%Y-%m-%d')
-    today = datetime.now()
+    days = (datetime.now() - last_dt).days
 
-    days_diff = (today - last_dt).days
+    if days >= LiveTradingConfig.REBALANCE_DAYS:
+        return True, f"{days} days since last rebalance"
 
-    if days_diff >= LiveTradingConfig.REBALANCE_DAYS:
-        return True, f"距上次调仓{days_diff}天"
-
-    return False, f"距上次调仓仅{days_diff}天"
+    return False, f"Only {days} days"
 
 
-def load_or_train_ml_model(factor_data, price_data, cache_manager):
-    """
-    ✨ 加载或训练ML模型
+def get_trading_signals(recommendations):
+    """从推荐提取交易信号"""
+    top = recommendations.head(LiveTradingConfig.POSITION_SIZE).copy()
+    weight = 1.0 / len(top)
+    top['target_weight'] = weight
+    top['current_price'] = top['close']
 
-    策略：
-    1. 检查是否有今日的缓存模型
-    2. 如果没有，使用滚动训练
-    3. 缓存训练好的模型供下次使用
-    """
-    if not ML_AVAILABLE:
-        print("  ⚠️  ML模块不可用，跳过ML评分")
-        return None
-
-    today = datetime.now().strftime('%Y%m%d')
-    model_cache_path = f'./data_cache/ml_model_{today}.pkl'
-
-    # 1. 尝试加载缓存模型
-    if LiveTradingConfig.ML_CACHE_MODELS and os.path.exists(model_cache_path):
-        try:
-            print("  📦 尝试加载缓存模型...")
-            with open(model_cache_path, 'rb') as f:
-                ml_scorer = pickle.load(f)
-            print(f"  ✓ 已加载缓存模型: {model_cache_path}")
-            return ml_scorer
-        except Exception as e:
-            print(f"  ⚠️  缓存加载失败: {e}")
-
-    # 2. 训练新模型
-    print(f"  🚀 训练ML模型（使用最近{LiveTradingConfig.ML_TRAIN_MONTHS}个月数据）...")
-
-    try:
-        ml_scorer = UltraMLScorer(
-            target_period=5,
-            top_percentile=0.2,
-            embargo_days=5,
-            neutralize_market=True,
-            neutralize_industry=True,
-            voting_strategy='average',
-            train_months=LiveTradingConfig.ML_TRAIN_MONTHS
-        )
-
-        # 注意：这里不调用 predict()，仅初始化
-        # 实际预测在 get_today_signals_with_ml 中进行
-
-        # 3. 缓存模型
-        if LiveTradingConfig.ML_CACHE_MODELS:
-            try:
-                os.makedirs('./data_cache', exist_ok=True)
-                with open(model_cache_path, 'wb') as f:
-                    pickle.dump(ml_scorer, f)
-                print(f"  💾 模型已缓存: {model_cache_path}")
-            except Exception as e:
-                print(f"  ⚠️  模型缓存失败: {e}")
-
-        return ml_scorer
-
-    except Exception as e:
-        print(f"  ❌ ML模型训练失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    return top[['instrument', 'position', 'target_weight', 'current_price']]
 
 
-def get_today_signals_with_ml(factor_data, price_data, ml_scorer=None):
-    """
-    ✨ 使用ML模型获取今日交易信号
-
-    流程：
-    1. 如果有ML模型，使用ML评分
-    2. 否则使用StockRanker的基础评分
-    3. 选择Top N只股票
-    """
-    today = datetime.now().strftime('%Y-%m-%d')
-
-    # 获取最新数据日期
-    latest_date = factor_data['date'].max()
-    print(f"  📅 使用数据日期: {latest_date}")
-
-    # 1. 如果启用ML且模型可用，进行ML评分
-    if LiveTradingConfig.USE_ML_SCORING and ml_scorer and ML_AVAILABLE:
-        print(f"  🤖 使用ML模型评分...")
-
-        try:
-            # 执行滚动预测（仅预测最后一个时间窗口）
-            scored_data = ml_scorer.predict(factor_data, price_data)
-
-            # 使用最新日期的数据
-            today_factors = scored_data[scored_data['date'] == latest_date]
-
-            if 'ml_score' in today_factors.columns:
-                print(f"  ✓ ML评分完成")
-                print(f"    - 评分范围: [{today_factors['ml_score'].min():.4f}, {today_factors['ml_score'].max():.4f}]")
-                score_column = 'ml_score'
-            else:
-                print(f"  ⚠️  未找到ml_score，使用position")
-                score_column = 'position'
-
-        except Exception as e:
-            print(f"  ⚠️  ML评分失败: {e}")
-            print(f"  ℹ️  降级使用StockRanker评分")
-            today_factors = factor_data[factor_data['date'] == latest_date]
-            score_column = 'position'
-    else:
-        # 2. 使用StockRanker的基础评分
-        print(f"  📊 使用StockRanker评分...")
-        today_factors = factor_data[factor_data['date'] == latest_date]
-        score_column = 'position'
-
-    if len(today_factors) == 0:
-        print(f"  ❌ 未找到有效数据")
-        return pd.DataFrame()
-
-    # 3. 选择Top N只股票
-    top_stocks = today_factors.nlargest(LiveTradingConfig.POSITION_SIZE, score_column)
-
-    # 等权分配
-    weight = 1.0 / len(top_stocks)
-
-    # 获取价格
-    today_prices = price_data[price_data['date'] == latest_date]
-
-    signals = []
-    for _, row in top_stocks.iterrows():
-        stock = row['instrument']
-        score = row[score_column]
-
-        price_row = today_prices[today_prices['instrument'] == stock]
-        price = price_row['close'].iloc[0] if len(price_row) > 0 else None
-
-        # 尝试获取行业信息
-        industry = row.get('industry', 'Unknown')
-
-        signals.append({
-            'stock': stock,
-            'score': score,
-            'target_weight': weight,
-            'current_price': price,
-            'industry': industry
-        })
-
-    return pd.DataFrame(signals)
-
-
-def compare_with_current_positions(signals, current_positions):
-    """对比目标持仓和当前持仓"""
-    target_stocks = set(signals['stock'])
-    current_stocks = set(current_positions.keys())
-
-    to_sell = list(current_stocks - target_stocks)
-    to_buy = signals[~signals['stock'].isin(current_stocks)]
-
-    return to_buy, to_sell
-
-
-def generate_trading_orders(signals, current_positions, available_cash, total_value):
-    """生成交易订单"""
+def generate_orders(signals, positions, cash, total):
+    """生成订单"""
     orders = []
+    target = set(signals['instrument'])
+    current = set(positions.keys())
 
-    target_stocks = set(signals['stock'])
-    current_stocks = set(current_positions.keys())
-
-    # 1. 卖出不在目标中的股票
-    for stock in (current_stocks - target_stocks):
-        shares = current_positions[stock]
+    # 卖出
+    for stock in (current - target):
         orders.append({
             'stock': stock,
             'action': 'sell',
-            'shares': shares,
-            'price': 0,
-            'amount': 0,
-            'reason': '不在目标持仓'
+            'shares': positions[stock],
+            'price': 0
         })
 
-    # 2. 买入新股票
-    to_buy = signals[~signals['stock'].isin(current_stocks)]
-
-    for _, row in to_buy.iterrows():
-        target_amount = total_value * row['target_weight']
+    # 买入
+    for _, row in signals[~signals['instrument'].isin(current)].iterrows():
+        amt = total * row['target_weight']
         price = row['current_price']
 
-        if price and price > 0:
-            shares = int(target_amount / price / 100) * 100
-
+        if price > 0:
+            shares = int(amt / price / 100) * 100
             if shares >= 100:
                 orders.append({
-                    'stock': row['stock'],
+                    'stock': row['instrument'],
                     'action': 'buy',
                     'shares': shares,
-                    'price': price,
-                    'amount': shares * price,
-                    'reason': f"ML评分: {row['score']:.4f}"
+                    'price': price
                 })
 
     return pd.DataFrame(orders)
 
 
-def reconcile_positions_after_orders(current_positions, orders_df):
-    """根据交易订单更新持仓"""
-    new_positions = current_positions.copy()
-
-    for _, order in orders_df.iterrows():
-        stock = order['stock']
-
-        if order['action'] == 'sell':
-            if stock in new_positions:
-                del new_positions[stock]
-
-        elif order['action'] == 'buy':
-            new_positions[stock] = int(order['shares'])
-
-    return new_positions
-
-
-def save_trading_orders(orders_df, signals_df, output_dir='./live_trading'):
-    """
-    ✨ 保存交易订单和选股信号
-
-    新增：
-    - 保存完整的信号数据（包含评分、行业等）
-    - 生成可读性更好的报告
-    """
+def save_orders(orders, signals, output_dir='./live_trading'):
     os.makedirs(output_dir, exist_ok=True)
-
     today = datetime.now().strftime('%Y%m%d')
 
-    # 1. 保存详细订单
-    orders_path = os.path.join(output_dir, f'trading_orders_{today}.csv')
-    orders_df.to_csv(orders_path, index=False, encoding='utf-8-sig')
-    print(f"\n💾 交易订单已保存: {orders_path}")
+    orders.to_csv(
+        os.path.join(output_dir, f'trading_orders_{today}.csv'),
+        index=False, encoding='utf-8-sig'
+    )
 
-    # 2. 保存信号数据
-    signals_path = os.path.join(output_dir, f'signals_{today}.csv')
-    signals_df.to_csv(signals_path, index=False, encoding='utf-8-sig')
-    print(f"💾 信号数据已保存: {signals_path}")
-
-    # 3. 生成可读报告
-    simple_path = os.path.join(output_dir, f'trading_instructions_{today}.txt')
-    with open(simple_path, 'w', encoding='utf-8') as f:
-        f.write(f"=" * 80 + "\n")
-        f.write(f"实盘交易建议 - ML增强版\n")
-        f.write(f"=" * 80 + "\n\n")
-
-        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"调仓周期: {LiveTradingConfig.REBALANCE_DAYS}日\n")
-        f.write(f"ML模型: {'已启用' if LiveTradingConfig.USE_ML_SCORING else '未启用'}\n")
-        f.write(f"\n" + "-" * 80 + "\n\n")
-
-        # 目标持仓
-        f.write(f"【目标持仓】共 {len(signals_df)} 只\n\n")
-        for i, row in signals_df.iterrows():
-            f.write(f"{i + 1:2d}. {row['stock']:12s} | "
-                    f"评分: {row['score']:.4f} | "
-                    f"权重: {row['target_weight']:6.1%} | "
-                    f"价格: ¥{row['current_price']:7.2f} | "
-                    f"行业: {row.get('industry', 'Unknown')}\n")
-
-        f.write(f"\n" + "-" * 80 + "\n\n")
-
-        # 交易指令
-        f.write(f"【交易指令】共 {len(orders_df)} 条\n\n")
-
-        if len(orders_df) == 0:
-            f.write("无需交易，保持当前持仓。\n")
-        else:
-            for i, order in orders_df.iterrows():
-                if order['action'] == 'buy':
-                    f.write(f"{i + 1:2d}. 🔵 买入 {order['stock']:12s} "
-                            f"{int(order['shares']):6d}股 @ ¥{order['price']:.2f} "
-                            f"(约 ¥{order['amount']:,.0f})\n")
-                elif order['action'] == 'sell':
-                    f.write(f"{i + 1:2d}. 🔴 卖出 {order['stock']:12s} "
-                            f"{int(order['shares']):6d}股 (市价)\n")
-
-        f.write(f"\n" + "=" * 80 + "\n")
-
-    print(f"💾 交易指令已保存: {simple_path}")
-
-    return orders_path
+    signals.to_csv(
+        os.path.join(output_dir, f'signals_{today}.csv'),
+        index=False, encoding='utf-8-sig'
+    )
 
 
-def execute_orders_guosen(orders_df, config):
-    """通过国信证券API执行订单"""
-    if not LiveTradingConfig.ENABLE_AUTO_TRADE:
-        print("\n⚠️  自动交易未启用，仅生成订单文件")
-        return
-
-    try:
-        import easytrader
-
-        user = easytrader.use('guosen')
-        user.prepare(
-            user=config['account'],
-            password=config['password'],
-            comm_password=config['comm_password']
-        )
-
-        print("\n🔗 已连接国信证券")
-
-        for _, order in orders_df.iterrows():
-            stock = order['stock']
-            action = order['action']
-            shares = int(order['shares'])
-
-            try:
-                if action == 'buy':
-                    result = user.buy(stock, price=0, amount=shares)
-                    print(f"  ✓ 买入 {stock} {shares}股")
-
-                elif action == 'sell':
-                    result = user.sell(stock, price=0, amount=shares)
-                    print(f"  ✓ 卖出 {stock} {shares}股")
-
-            except Exception as e:
-                print(f"  ❌ 订单失败 {stock}: {e}")
-
-        print("\n✅ 订单执行完成")
-
-    except ImportError:
-        print("\n❌ 未安装 easytrader 库")
-        print("   安装命令: pip install easytrader")
-    except Exception as e:
-        print(f"\n❌ 交易执行失败: {e}")
-
+# ========== 主函数 ==========
 
 def main():
-    """主函数"""
     print("\n" + "=" * 80)
-    print("🤖 实盘交易系统 - ML增强版 v2.6")
+    print("LIVE TRADING SYSTEM v3.1 (Enhanced)")
     print("=" * 80)
-    print(f"  策略: 5日调仓-等权 + ML选股")
-    print(f"  ML模型: {'✓ 滚动训练' if LiveTradingConfig.USE_ML_SCORING else '✗ 未启用'}")
-    print(f"  模式: {'自动交易' if LiveTradingConfig.ENABLE_AUTO_TRADE else '仅生成建议'}")
-    print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Strategy: {LiveTradingConfig.REBALANCE_DAYS}-day rebalance")
+    print(f"Scoring: {LiveTradingConfig.FUSION_METHOD}")
+    print(f"Position Size: {LiveTradingConfig.POSITION_SIZE}")
+    print(f"Recommendations: Top {LiveTradingConfig.RECOMMEND_TOP_N}")
 
-    # 1. 检查交易日
-    print("\n【步骤1/6】检查交易日")
-
+    # 1. Check trading day
+    print("\n[Step 1/7] Check Trading Day")
     if not check_trading_day():
-        print("  ℹ️  今天不是交易日")
+        print("Not a trading day")
         return
+    print("Confirmed")
 
-    print("  ✓ 确认为交易日")
-
-    # 2. 加载历史状态
-    print("\n【步骤2/6】加载历史状态")
-
-    state = load_historical_state()
-
+    # 2. Load state
+    print("\n[Step 2/7] Load State")
+    state = load_state()
     if state['last_rebalance_date']:
-        print(f"  上次调仓: {state['last_rebalance_date']}")
-        print(f"  当前持仓: {len(state['positions'])} 只")
-        if state.get('last_ml_train_date'):
-            print(f"  上次ML训练: {state['last_ml_train_date']}")
+        print(f"Last rebalance: {state['last_rebalance_date']}")
     else:
-        print("  首次运行")
+        print("First run")
 
-    # 3. 判断是否需要调仓
-    print("\n【步骤3/6】判断调仓时机")
+    # 3. Load data
+    print("\n[Step 3/7] Load Data")
+    START = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    END = datetime.now().strftime('%Y-%m-%d')
 
-    need_rebalance, reason = should_rebalance(state)
-    print(f"  是否调仓: {'是' if need_rebalance else '否'} ({reason})")
+    cache = DataCache(cache_dir='./data_cache')
 
-    if not need_rebalance:
-        print("\n  今日无需调仓")
-        return
-
-    # 4. 加载数据
-    print("\n【步骤4/6】加载最新数据")
-
-    # 使用更长的历史数据窗口（12个月+）用于ML训练
-    START_DATE = (datetime.now() - timedelta(days=365 + 90)).strftime('%Y-%m-%d')
-    END_DATE = datetime.now().strftime('%Y-%m-%d')
-
-    cache_manager = DataCache(cache_dir='./data_cache')
-
-    start_time = time.time()
     factor_data, price_data = load_data_with_incremental_update(
-        START_DATE,
-        END_DATE,
+        START, END,
         max_stocks=LiveTradingConfig.SAMPLE_SIZE,
-        cache_manager=cache_manager,
+        cache_manager=cache,
         use_stockranker=True,
         tushare_token=TUSHARE_TOKEN,
         use_fundamental=True,
-        use_money_flow=True,  # ✨ 启用资金流因子
-        use_sampling=LiveTradingConfig.USE_SAMPLING,
-        sample_size=LiveTradingConfig.SAMPLE_SIZE,
-        max_workers=10,
-        force_full_update=False,
-        min_days_listed=180
+        max_workers=10
     )
 
-    if factor_data is None or price_data is None:
-        print("  ❌ 数据加载失败")
+    if factor_data is None:
+        print("Data loading failed")
         return
 
-    # 补全行业数据
-    ds = TushareDataSource(token=TUSHARE_TOKEN, cache_manager=cache_manager)
-    industry_df = ds.get_industry_data(
-        factor_data['instrument'].unique().tolist(),
-        use_cache=True
-    )
+    print("Data loaded")
 
-    if industry_df is not None and not industry_df.empty:
-        if 'industry' in factor_data.columns:
-            del factor_data['industry']
-        factor_data = factor_data.merge(industry_df, on='instrument', how='left')
-        factor_data['industry'] = factor_data['industry'].fillna('其他')
-    else:
-        factor_data['industry'] = 'Unknown'
+    # 4. Score processing
+    print("\n[Step 4/7] Score Processing")
+    factor_data = fix_stockranker_scoring(factor_data)
+    factor_data = fix_ml_scoring(factor_data, price_data)
+    factor_data = fuse_scores(factor_data)
+    print("Scoring completed")
 
-    print(f"  ✓ 数据加载完成 (耗时: {time.time() - start_time:.1f}秒)")
-    print(f"    - 股票数: {factor_data['instrument'].nunique()}")
-    print(f"    - 时间范围: {factor_data['date'].min()} ~ {factor_data['date'].max()}")
+    # 5. Generate recommendations (KEY FEATURE)
+    print("\n[Step 5/7] Generate Recommendations")
+    recommendations = generate_recommendations(factor_data, price_data, state)
 
-    # 5. ML模型训练/加载
-    print("\n【步骤5/6】ML模型准备")
+    # Print to console
+    print_recommendations(recommendations)
 
-    ml_scorer = None
-    if LiveTradingConfig.USE_ML_SCORING:
-        ml_start_time = time.time()
-        ml_scorer = load_or_train_ml_model(factor_data, price_data, cache_manager)
-        ml_time = time.time() - ml_start_time
+    # Save report
+    generate_report(recommendations)
+    save_recommendations_csv(recommendations)
 
-        if ml_scorer:
-            print(f"  ✓ ML模型就绪 (耗时: {ml_time:.1f}秒)")
-            state['last_ml_train_date'] = datetime.now().strftime('%Y-%m-%d')
-        else:
-            print(f"  ⚠️  ML模型不可用，使用基础评分")
-    else:
-        print(f"  ℹ️  ML评分已禁用")
+    # 6. Check rebalance
+    print("\n[Step 6/7] Check Rebalance")
+    need_rebal, reason = should_rebalance(state)
+    print(f"Rebalance: {need_rebal} ({reason})")
 
-    # 6. 生成交易信号
-    print("\n【步骤6/6】生成交易信号")
-
-    signals = get_today_signals_with_ml(factor_data, price_data, ml_scorer)
-
-    if len(signals) == 0:
-        print("  ❌ 未能生成有效信号")
+    if not need_rebal:
+        print("\nNo rebalance needed today")
         return
 
-    print(f"\n  ✨ 目标持仓 ({len(signals)} 只):")
-    print(f"  {'序号':<4} | {'代码':<12} | {'评分':<8} | {'权重':<8} | {'价格':<10} | {'行业'}")
-    print(f"  {'-' * 70}")
+    # 7. Generate trading orders
+    print("\n[Step 7/7] Generate Orders")
+    signals = get_trading_signals(recommendations)
+    positions = state.get('positions', {})
 
-    for i, row in signals.iterrows():
-        print(f"  {i + 1:2d}.  | {row['stock']:<12} | {row['score']:<8.4f} | "
-              f"{row['target_weight']:<7.1%} | ¥{row['current_price']:<8.2f} | "
-              f"{row.get('industry', 'Unknown')}")
-
-    # 对比当前持仓
-    current_positions = state.get('positions', {})
-    to_buy, to_sell = compare_with_current_positions(signals, current_positions)
-
-    print(f"\n  需要调整:")
-    print(f"    🔴 卖出: {len(to_sell)} 只")
-    print(f"    🔵 买入: {len(to_buy)} 只")
-
-    # 生成订单
-    available_cash = 1000000
-    total_value = 1000000
-
-    orders = generate_trading_orders(signals, current_positions, available_cash, total_value)
+    orders = generate_orders(signals, positions, 1000000, 1000000)
 
     if len(orders) > 0:
-        print(f"\n  📋 交易订单 ({len(orders)} 条):")
+        print(f"\nOrders: {len(orders)}")
         for _, order in orders.iterrows():
-            action_icon = "🔵" if order['action'] == 'buy' else "🔴"
-            print(f"    {action_icon} {order['action']:4s} {order['stock']:12s} "
-                  f"{int(order['shares']):6d}股 @ ¥{order['price']:.2f}")
+            print(f"  {order['action'].upper()} {order['stock']} {int(order['shares'])} shares")
 
-        # 保存订单和信号
-        save_trading_orders(orders, signals)
+        save_orders(orders, signals)
 
-        # 询问是否执行
-        if LiveTradingConfig.ENABLE_AUTO_TRADE:
-            response = input("\n  是否执行交易？(y/n): ").lower()
-            if response == 'y':
-                execute_orders_guosen(orders, LiveTradingConfig.GUOSEN_CONFIG)
-            else:
-                print("  已取消自动交易")
-
-        # 更新状态
+        # Update state
         state['last_rebalance_date'] = datetime.now().strftime('%Y-%m-%d')
-        state['positions'] = reconcile_positions_after_orders(current_positions, orders)
-        state['rebalance_history'].append({
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'orders_count': len(orders),
-            'ml_enabled': LiveTradingConfig.USE_ML_SCORING
-        })
+        for _, order in orders.iterrows():
+            if order['action'] == 'sell':
+                if order['stock'] in state['positions']:
+                    del state['positions'][order['stock']]
+            elif order['action'] == 'buy':
+                state['positions'][order['stock']] = int(order['shares'])
 
-        save_current_state(state)
-
-        print(f"\n  ✓ 状态已更新，新持仓: {len(state['positions'])} 只")
-
+        save_state(state)
+        print("\nState updated")
     else:
-        print("\n  ℹ️  无需交易，保持当前持仓")
+        print("\nNo orders needed")
 
     print("\n" + "=" * 80)
-    print("✅ 完成！")
+    print("COMPLETED")
     print("=" * 80)
 
 
@@ -663,9 +741,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  用户中断")
+        print("\n\nInterrupted by user")
     except Exception as e:
-        print(f"\n\n❌ 错误: {e}")
+        print(f"\n\nError: {e}")
         import traceback
-
         traceback.print_exc()

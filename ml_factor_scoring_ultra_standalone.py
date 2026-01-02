@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 import warnings
@@ -10,6 +9,7 @@ warnings.filterwarnings('ignore')
 # 检查模型库
 try:
     import xgboost as xgb
+
     XGBOOST_AVAILABLE = True
 except ImportError:
     xgb = None
@@ -17,6 +17,7 @@ except ImportError:
 
 try:
     import lightgbm as lgb
+
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     lgb = None
@@ -28,6 +29,7 @@ except ImportError:
 # ============================================================================
 class PurgingEmbargoSplitter:
     """数据隔离切分器"""
+
     def __init__(self, train_months=12, valid_months=1, embargo_days=5):
         self.train_months = train_months
         self.valid_months = valid_months
@@ -69,6 +71,7 @@ class PurgingEmbargoSplitter:
 # ============================================================================
 class FeatureOrthogonalizer:
     """特征正交化 - 截面回归版"""
+
     def __init__(self, neutralize_market=True, neutralize_industry=True):
         self.neutralize_market = neutralize_market
         self.neutralize_industry = neutralize_industry
@@ -103,7 +106,6 @@ class FeatureOrthogonalizer:
         valid_factors = [f for f in factor_columns if f in data.columns]
 
         # 3. 准备GroupBy需要的列列表
-        # 关键修复：只有当列真正存在时，才加入到 groupby 列表
         group_cols = list(valid_factors)
         if has_market_col: group_cols.append('_mkt')
         if has_industry_col: group_cols.append('industry')
@@ -117,8 +119,6 @@ class FeatureOrthogonalizer:
                 X_list.append(df_day[['_mkt']].values)
 
             if has_industry_col:
-                # 使用 numpy 处理 dummy 变量比 pandas get_dummies 快且稳
-                # 这里为了简单稳健，还是用 get_dummies，但在 apply 内部要小心
                 ind = pd.get_dummies(df_day['industry'], drop_first=True).values
                 if ind.shape[1] > 0:
                     X_list.append(ind)
@@ -130,25 +130,22 @@ class FeatureOrthogonalizer:
                 y = df_day[valid_factors].values
 
                 # 线性回归求残差: e = y - X*beta
-                # rcond=None 解决奇异矩阵警告
                 beta = np.linalg.lstsq(X, y, rcond=None)[0]
                 res = y - X @ beta
                 return pd.DataFrame(res, index=df_day.index, columns=valid_factors)
             except Exception:
-                # 如果回归失败（如数据全一样），返回原值
                 return df_day[valid_factors]
 
         # 4. 执行 GroupBy Apply
-        # 注意：这里我们只取需要的列进行 groupby，提高效率并防止 key error
         ortho = data.groupby('date')[group_cols].apply(neutralize_day)
 
-        # 处理多级索引问题 (pandas版本差异)
+        # 处理多级索引问题
         if isinstance(ortho, pd.DataFrame):
             if 'date' in ortho.index.names:
                 try:
                     ortho = ortho.reset_index(level='date', drop=True)
                 except IndexError:
-                    pass # 有时索引已经被重置
+                    pass
 
             # 使用 update 原地更新
             data.update(ortho)
@@ -158,10 +155,8 @@ class FeatureOrthogonalizer:
         return data
 
     def _detect_price_column(self, df):
-        # 优先匹配完全一致的
         for col in ['close', 'Close', 'price', 'Price', 'CLOSE']:
             if col in df.columns: return col
-        # 模糊匹配 (处理 close_x, close_y 的情况，返回第一个找到的含 close 的数值列)
         for col in df.columns:
             if 'close' in col.lower() and pd.api.types.is_numeric_dtype(df[col]):
                 return col
@@ -173,6 +168,7 @@ class FeatureOrthogonalizer:
 # ============================================================================
 class EnsembleVotingScorer:
     """集成投票器"""
+
     def __init__(self, voting_strategy='strict'):
         self.voting_strategy = voting_strategy
         self.xgb_model = None
@@ -180,7 +176,6 @@ class EnsembleVotingScorer:
         self.scaler = StandardScaler()
 
     def train(self, X_train, y_train, X_valid, y_valid):
-        # 填充NaN防止报错
         X_train = X_train.fillna(0)
         X_valid = X_valid.fillna(0)
 
@@ -222,9 +217,7 @@ class EnsembleVotingScorer:
         p_avg = np.mean(preds, axis=0)
 
         if self.voting_strategy == 'strict' and len(preds) == 2:
-            # 只有两个模型都看好(>0.5)才给高分，否则惩罚
             consensus = (preds[0] > 0.5) & (preds[1] > 0.5)
-            # 加大区分度
             return np.where(consensus, p_avg * 1.2, p_avg * 0.8)
 
         return p_avg
@@ -234,13 +227,13 @@ class EnsembleVotingScorer:
 # 4. UltraMLScorer (主类 - API兼容版)
 # ============================================================================
 class UltraMLScorer:
-    """超级ML评分器 - API兼容版"""
+    """超级ML评分器 - API兼容版 (胜率增强版)"""
 
     def __init__(self,
                  target_period=5,
                  top_percentile=0.20,
                  embargo_days=5,
-                 neutralize_market=True,
+                 neutralize_market=False,  # ✅ 关键修改：默认关闭市场中性化，保留Beta
                  neutralize_industry=True,
                  voting_strategy='average',
                  train_months=12,
@@ -252,65 +245,62 @@ class UltraMLScorer:
         self.train_months = train_months
         self.voting_strategy = voting_strategy
 
-        # 初始化组件
         self.orthogonalizer = FeatureOrthogonalizer(neutralize_market, neutralize_industry)
         self.ensemble = None
         self.feature_names = None
         self.scaler = StandardScaler()
 
-        print(f"\n🚀 初始化UltraMLScorer:")
-        print(f"  Gap={embargo_days}d, MktNeut={neutralize_market}, IndNeut={neutralize_industry}, Vote={voting_strategy}")
+        print(f"\n🚀 初始化UltraMLScorer (胜率增强版):")
+        print(f"  Target=Top{top_percentile:.0%}+AbsRet>0, MktNeut={neutralize_market}")
 
     def prepare_data(self, factor_data, price_data, factor_columns):
         """准备数据：合并 + 正交化 + 标签生成"""
         print(f"\n📦 准备训练数据...")
 
-        # 1. 检测价格列
         price_col = self.orthogonalizer._detect_price_column(price_data)
         if not price_col:
             raise ValueError("未在 price_data 中找到价格列")
 
-        # 2. 智能合并 (关键修复)
-        # 如果 factor_data 和 price_data 是同一个对象或包含相同列，先处理
         merged = factor_data.copy()
-
-        # 如果merged里已经有价格列，就不用merge了，或者确保不重复merge
         if price_col in merged.columns:
             print(f"  ✓ 价格列 '{price_col}' 已存在，跳过合并")
         else:
-            # 执行合并
             merged = merged.merge(price_data[['instrument', 'date', price_col]], on=['instrument', 'date'], how='left')
 
         merged = merged.sort_values(['instrument', 'date'])
 
-        # 3. 特征正交化 (在全量数据上按日处理)
-        merged = self.orthogonalizer.fit_transform(merged, factor_columns)
+        # 排除包含 'ml_score', 'position' 等列作为特征
+        actual_features = [c for c in factor_columns if
+                           c in merged.columns and c not in ['ml_score', 'position', 'target']]
 
-        # 4. 生成Target (超额收益 Top K)
-        # 再次确认价格列存在 (防止正交化过程误删)
+        # 特征正交化
+        merged = self.orthogonalizer.fit_transform(merged, actual_features)
+
+        # ✅ 生成Target (关键修改：加入绝对收益限制)
         price_col = self.orthogonalizer._detect_price_column(merged)
-
-        merged['fwd_ret'] = merged.groupby('instrument')[price_col].pct_change(self.target_period).shift(-self.target_period)
-        merged['mkt_ret'] = merged.groupby('date')['fwd_ret'].transform('mean')
-        merged['active_ret'] = merged['fwd_ret'] - merged['mkt_ret']
+        merged['fwd_ret'] = merged.groupby('instrument')[price_col].pct_change(self.target_period).shift(
+            -self.target_period)
 
         merged['target'] = 0
-        def get_label(x):
+
+        def get_label_strict(x):
             if len(x) < 5: return pd.Series(0, index=x.index)
-            # 使用 float 防止 dtype 问题
+            # 1. 相对排名 Top 20%
             thresh = float(x.quantile(1 - self.top_percentile))
-            return (x >= thresh).astype(int)
+            is_top = (x >= thresh)
 
-        merged['target'] = merged.groupby('date')['active_ret'].transform(get_label)
+            # 2. ✅ 绝对收益 > 0.5% (过滤掉下跌趋势中的"相对好")
+            is_profit = (x > 0.005)
 
-        # 过滤有效样本
-        valid_data = merged.dropna(subset=['target', 'active_ret'] + factor_columns)
-        print(f"  ✓ 有效样本: {len(valid_data)}")
+            return (is_top & is_profit).astype(int)
 
-        self.feature_names = factor_columns
+        merged['target'] = merged.groupby('date')['fwd_ret'].apply(get_label_strict).reset_index(level=0, drop=True)
 
-        # 返回 X, y, full_df
-        return valid_data[factor_columns], valid_data['target'], valid_data
+        valid_data = merged.dropna(subset=['target', 'fwd_ret'] + actual_features)
+        print(f"  ✓ 有效样本: {len(valid_data)} (正样本比例: {valid_data['target'].mean():.1%})")
+
+        self.feature_names = actual_features
+        return valid_data[actual_features], valid_data['target'], valid_data
 
     def train(self, X, y, merged, verbose=False):
         """滚动训练"""
@@ -320,21 +310,23 @@ class UltraMLScorer:
         splits = splitter.split(merged)
 
         if not splits:
-            print("  ⚠️ 数据不足，无法切分")
-            return
+            print("  ⚠️ 数据不足，无法切分，使用全量训练")
+            model = EnsembleVotingScorer(self.voting_strategy)
+            model.train(X, y, X, y)
+            self.ensemble = model
+            return self
 
-        # 模拟滚动训练，只保留最后模型
         for i, (tr_idx, val_idx) in enumerate(splits):
             X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
             X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
 
+            if y_tr.sum() < 10 or y_val.sum() < 5: continue
+
             model = EnsembleVotingScorer(self.voting_strategy)
             model.train(X_tr, y_tr, X_val, y_val)
+            self.ensemble = model  # 保留最新的模型
 
-            self.ensemble = model
-
-            if verbose:
-                print(f"  Window {i+1}: Done")
+            if verbose: print(f"  Window {i + 1}: Done")
 
         print("  ✓ 训练完成")
         return self
@@ -342,10 +334,7 @@ class UltraMLScorer:
     def predict(self, factor_data, price_data=None):
         """预测"""
         if price_data is not None:
-            # 回测模式：重新跑正交化
-            # 为了防止 merge 冲突，这里做一个简化处理：
-            # 如果 factor_data 已经包含所有列且已经正交化过（通常在回测脚本里不容易判断），
-            # 最安全的方式是重新调用 fit_transform
+            # 回测时确保特征一致
             factor_data = self.orthogonalizer.fit_transform(factor_data, self.feature_names)
 
         print(f"\n🔮 执行预测...")
@@ -360,5 +349,5 @@ class UltraMLScorer:
         result['ml_score'] = preds
         return result
 
-# 导出
+
 __all__ = ['UltraMLScorer']

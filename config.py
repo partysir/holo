@@ -198,6 +198,106 @@ class OutputConfig:
     PERFORMANCE_REPORT = 'performance_report.txt'
 
 
+# ========== 实盘交易配置 ==========
+class LiveTradingConfig:
+    """实盘交易配置"""
+
+    # 是否启用自动交易
+    # ⚠️ 警告：首次使用请设为 False，先检查订单文件
+    ENABLE_AUTO_TRADE = False
+
+    # 券商配置
+    BROKER = 'guosen'  # 'guosen' | 'gf' | 'ht' | 'yh' | 'yjb'
+
+    # 初始资金（用于计算买入数量）
+    INITIAL_CAPITAL = 1000000
+
+    # 最小买入金额
+    MIN_BUY_AMOUNT = 5000
+
+    # 账户信息（从环境变量读取，更安全）
+    # 使用方法：
+    # export BROKER_ACCOUNT="your_account"
+    # export BROKER_PASSWORD="your_password"
+    ACCOUNT = None  # 留空，从环境变量读取
+    PASSWORD = None
+    COMM_PASSWORD = None
+
+    # 输出配置
+    OUTPUT_DIR = './live_trading'
+    SAVE_CSV = True
+    SAVE_TXT = True
+    SAVE_JSON = True
+
+    # 日志级别
+    LOG_LEVEL = 'INFO'  # 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR'
+
+    # 是否发送通知
+    ENABLE_NOTIFICATION = False
+
+    # 通知方式
+    # - 'email': 邮件
+    # - 'wechat': 微信（需要企业微信）
+    # - 'dingtalk': 钉钉
+    NOTIFICATION_METHOD = 'email'
+
+    # ML相关配置
+    ML_CACHE_MODELS = True  # 缓存训练好的模型
+    ML_TRAIN_MONTHS = 12  # 训练窗口（月）
+    USE_ML_SCORING = True  # 启用ML评分
+
+    # 策略参数
+    REBALANCE_DAYS = 5  # 调仓周期
+    POSITION_SIZE = 10  # 持仓数量
+
+    # 数据配置
+    SAMPLE_SIZE = 4000
+    USE_SAMPLING = False
+
+
+# ========== 券商配置模板 ==========
+class BrokerConfig:
+    """券商API配置"""
+
+    # 国信证券
+    GUOSEN = {
+        'broker': 'guosen',
+        'account': '',
+        'password': '',
+        'comm_password': '',
+        'ip': '',
+        'port': 0,
+    }
+
+    # 广发证券
+    GUANGFA = {
+        'broker': 'gf',
+        'account': '',
+        'password': '',
+    }
+
+    # 华泰证券
+    HUATAI = {
+        'broker': 'ht',
+        'account': '',
+        'password': '',
+    }
+
+    # 银河证券
+    YINHE = {
+        'broker': 'yh',
+        'account': '',
+        'password': '',
+    }
+
+    # 一键报盘
+    YJB = {
+        'broker': 'yjb',
+        'account': '',
+        'password': '',
+    }
+
+
 # ========== 通用函数 ==========
 def get_strategy_params():
     """获取策略运行所需的完整参数"""
@@ -235,4 +335,26 @@ def get_strategy_params():
 
         # 调试
         'debug': StrategyConfig.DEBUG_MODE,
+    }
+
+def get_live_trading_params():
+    """获取实盘交易运行所需的完整参数"""
+    return {
+        # 实盘交易控制
+        'enable_auto_trade': LiveTradingConfig.ENABLE_AUTO_TRADE,
+        'broker': LiveTradingConfig.BROKER,
+        'initial_capital': LiveTradingConfig.INITIAL_CAPITAL,
+        'min_buy_amount': LiveTradingConfig.MIN_BUY_AMOUNT,
+        'account': LiveTradingConfig.ACCOUNT,
+        'password': LiveTradingConfig.PASSWORD,
+        'comm_password': LiveTradingConfig.COMM_PASSWORD,
+
+        # 输出配置
+        'output_dir': LiveTradingConfig.OUTPUT_DIR,
+        'save_csv': LiveTradingConfig.SAVE_CSV,
+        'save_txt': LiveTradingConfig.SAVE_TXT,
+        'save_json': LiveTradingConfig.SAVE_JSON,
+        'log_level': LiveTradingConfig.LOG_LEVEL,
+        'enable_notification': LiveTradingConfig.ENABLE_NOTIFICATION,
+        'notification_method': LiveTradingConfig.NOTIFICATION_METHOD,
     }
